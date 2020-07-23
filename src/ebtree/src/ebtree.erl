@@ -1392,6 +1392,24 @@ custom_collation_reverse_range_test_() ->
     end}.
 
 
+cache_test_() ->
+    {spawn, [fun() ->
+        Db = erlfdb_util:get_test_db([empty]),
+        CacheFun = fun
+            (set, Node) ->
+                erlang:put(Node#node.id, Node);
+            (clear, Node) ->
+                erlang:erase(Node#node.id);
+            (get, Id) ->
+                erlang:get(Id)
+        end,
+        Tree = open(Db, <<1,2,3>>, 4, [{cache_fun, CacheFun}]),
+        [ebtree:insert(Db, Tree, I, I) || I <- lists:seq(1, 16)],
+        ?assertEqual({1, 1}, ebtree:lookup(Db, Tree, 1)),
+        NodeCache = [V || {_K, V} <- erlang:get(), is_record(V, node)],
+        ?assertEqual(3, length(NodeCache))
+    end]}.
+
 msec(Native) ->
     erlang:max(1, erlang:convert_time_unit(Native, native, millisecond)).
 
