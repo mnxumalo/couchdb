@@ -45,7 +45,8 @@
     max,
     collate_fun,
     reduce_fun,
-    encode_fun
+    encode_fun,
+    cache_fun
 }).
 
 -define(META, 0).
@@ -82,12 +83,14 @@ open(Db, Prefix, Order, Options) when is_binary(Prefix), is_integer(Order), Orde
     ReduceFun = proplists:get_value(reduce_fun, Options, fun reduce_noop/2),
     CollateFun = proplists:get_value(collate_fun, Options, fun collate_raw/2),
     EncodeFun = proplists:get_value(encode_fun, Options, fun encode_erlang/3),
+    CacheFun = proplists:get_value(cache_fun, Options, fun cache_noop/2),
 
     Tree = #tree{
         prefix = Prefix,
         reduce_fun = ReduceFun,
         collate_fun = CollateFun,
-        encode_fun = EncodeFun
+        encode_fun = EncodeFun,
+        cache_fun = CacheFun
     },
 
     erlfdb:transactional(Db, fun(Tx) ->
@@ -735,10 +738,17 @@ meta_key(Prefix, MetaKey) when is_binary(Prefix) ->
 %% node persistence functions
 
 get_node(Tx, #tree{} = Tree, Id) ->
-    Key = node_key(Tree#tree.prefix, Id),
-    Future = erlfdb:get(Tx, Key),
-    Value = erlfdb:wait(Future),
-    decode_node(Tree, Id, Key, Value).
+    case cache_fun(Tree, get, Id) of
+        undefined ->
+            Key = node_key(Tree#tree.prefix, Id),
+            Future = erlfdb:get(Tx, Key),
+            Value = erlfdb:wait(Future),
+            Node = decode_node(Tree, Id, Key, Value),
+            cache_fun(Tree, set, Node),
+            Node;
+        #node{} = Node ->
+            Node
+    end.
 
 
 clear_nodes(Tx, #tree{} = Tree, Nodes) ->
@@ -748,8 +758,9 @@ clear_nodes(Tx, #tree{} = Tree, Nodes) ->
 
 
 clear_node(Tx, #tree{} = Tree, #node{} = Node) ->
-     Key = node_key(Tree#tree.prefix, Node#node.id),
-     erlfdb:clear(Tx, Key).
+    Key = node_key(Tree#tree.prefix, Node#node.id),
+    cache_fun(Tree, clear, Node),
+    erlfdb:clear(Tx, Key).
 
 
 set_nodes(Tx, #tree{} = Tree, Nodes) ->
@@ -762,6 +773,7 @@ set_node(Tx, #tree{} = Tree, #node{} = Node) ->
     validate_node(Tree, Node),
     Key = node_key(Tree#tree.prefix, Node#node.id),
     Value = encode_node(Tree, Key, Node),
+    cache_fun(Tree, set, Node),
     erlfdb:set(Tx, Key, Value).
 
 
@@ -949,6 +961,38 @@ encode_erlang(encode, _Key, Value) ->
 
 encode_erlang(decode, _Key, Value) ->
     binary_to_term(Value, [safe]).
+
+%% cache functions
+
+cache_noop(set, _) ->
+    ok;
+cache_noop(clear, _) ->
+    ok;
+cache_noop(get, _) ->
+    undefined.
+
+
+cache_fun(#tree{} = Tree, Action, #node{} = Node) when Action == set; Action == clear ->
+    #tree{cache_fun = CacheFun} = Tree,
+    NodeIsCacheable = node_is_cacheable(Node),
+    if
+        NodeIsCacheable andalso CacheFun /= undefined ->
+            CacheFun(Action, Node);
+        true ->
+            ok
+    end;
+
+cache_fun(#tree{} = _Tree, get, ?NODE_ROOT_ID) ->
+    undefined;
+
+cache_fun(#tree{} = Tree, get, Id) ->
+    #tree{cache_fun = CacheFun} = Tree,
+    if
+        CacheFun /= undefined ->
+            CacheFun(get, Id);
+        true ->
+            undefined
+    end.
 
 %% private functions
 
