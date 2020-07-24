@@ -103,7 +103,8 @@ init() ->
             ok;
         error:database_does_not_exist ->
             fail_job(Job, Data, db_deleted, "Database was deleted");
-        Error:Reason  ->
+        Error:Reason:Stack  ->
+            couch_log:error("~p : ~p~n~p~n", [Error, Reason, Stack]),
             couch_rate:failure(Limiter),
             NewRetry = Retries + 1,
             RetryLimit = retry_limit(),
@@ -184,6 +185,7 @@ update(#{} = Db, Mrst0, State0) ->
 
 do_update(Db, Mrst0, State0) ->
     fabric2_fdb:transactional(Db, fun(TxDb) ->
+        Mrst1 = couch_views_fdb:set_trees(TxDb, Mrst0),
         State1 = get_update_start_state(TxDb, Mrst0, State0),
 
         {ok, State2} = fold_changes(State1),
@@ -200,8 +202,8 @@ do_update(Db, Mrst0, State0) ->
         DocAcc1 = fetch_docs(TxDb, DocAcc),
         couch_rate:in(Limiter, Count),
 
-        {Mrst1, MappedDocs} = map_docs(Mrst0, DocAcc1),
-        WrittenDocs = write_docs(TxDb, Mrst1, MappedDocs, State2),
+        {Mrst2, MappedDocs} = map_docs(Mrst1, DocAcc1),
+        WrittenDocs = write_docs(TxDb, Mrst2, MappedDocs, State2),
 
         ChangesDone = ChangesDone0 + WrittenDocs,
 
@@ -209,14 +211,14 @@ do_update(Db, Mrst0, State0) ->
 
         case Count < Limit of
             true ->
-                maybe_set_build_status(TxDb, Mrst1, ViewVS,
+                maybe_set_build_status(TxDb, Mrst2, ViewVS,
                     ?INDEX_READY),
                 report_progress(State2#{changes_done := ChangesDone},
                     finished),
-                {Mrst1, finished};
+                {Mrst2, finished};
             false ->
                 State3 = report_progress(State2, update),
-                {Mrst1, State3#{
+                {Mrst2, State3#{
                     tx_db := undefined,
                     count := 0,
                     doc_acc := [],
@@ -355,7 +357,6 @@ map_docs(Mrst, Docs) ->
 
 write_docs(TxDb, Mrst, Docs, State) ->
     #mrst{
-        views = Views,
         sig = Sig
     } = Mrst,
 
@@ -363,20 +364,19 @@ write_docs(TxDb, Mrst, Docs, State) ->
         last_seq := LastSeq
     } = State,
 
-    ViewIds = [View#mrview.id_num || View <- Views],
     KeyLimit = key_size_limit(),
     ValLimit = value_size_limit(),
 
-    DocsNumber = lists:foldl(fun(Doc0, N) ->
-        Doc1 = calculate_kv_sizes(Mrst, Doc0, KeyLimit, ValLimit),
-        couch_views_fdb:write_doc(TxDb, Sig, ViewIds, Doc1),
-        N + 1
-    end, 0, Docs),
+    lists:foreach(fun(Doc0) ->
+        Doc1 = check_kv_size_limit(Mrst, Doc0, KeyLimit, ValLimit),
+        couch_views_fdb:write_doc(TxDb, Mrst, Doc1)
+    end, Docs),
 
     if LastSeq == false -> ok; true ->
         couch_views_fdb:set_update_seq(TxDb, Sig, LastSeq)
     end,
-    DocsNumber.
+
+    length(Docs).
 
 
 fetch_docs(Db, Changes) ->
@@ -451,7 +451,7 @@ start_query_server(#mrst{} = Mrst) ->
     Mrst.
 
 
-calculate_kv_sizes(Mrst, Doc, KeyLimit, ValLimit) ->
+check_kv_size_limit(Mrst, Doc, KeyLimit, ValLimit) ->
     #mrst{
         db_name = DbName,
         idx_name = IdxName
@@ -460,10 +460,10 @@ calculate_kv_sizes(Mrst, Doc, KeyLimit, ValLimit) ->
         results := Results
     } = Doc,
     try
-        KVSizes = lists:map(fun(ViewRows) ->
-            lists:foldl(fun({K, V}, Acc) ->
-                KeySize = erlang:external_size(K),
-                ValSize = erlang:external_size(V),
+        lists:foreach(fun(ViewRows) ->
+            lists:foreach(fun({K, V}) ->
+                KeySize = couch_ejson_size:encoded_size(K),
+                ValSize = couch_ejson_size:encoded_size(V),
 
                 if KeySize =< KeyLimit -> ok; true ->
                     throw({size_error, key})
@@ -471,12 +471,10 @@ calculate_kv_sizes(Mrst, Doc, KeyLimit, ValLimit) ->
 
                 if ValSize =< ValLimit -> ok; true ->
                     throw({size_error, value})
-                end,
-
-                Acc + KeySize + ValSize
-            end, 0, ViewRows)
+                end
+            end, ViewRows)
         end, Results),
-        Doc#{kv_sizes => KVSizes}
+        Doc
     catch throw:{size_error, Type} ->
         #{id := DocId} = Doc,
         Fmt = "View ~s size error for docid `~s`, excluded from indexing "

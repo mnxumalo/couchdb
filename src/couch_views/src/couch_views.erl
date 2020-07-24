@@ -100,9 +100,10 @@ get_info(Db, DDoc) ->
     {ok, Mrst} = couch_views_util:ddoc_to_mrst(DbName, DDoc),
     Sig = fabric2_util:to_hex(Mrst#mrst.sig),
     {UpdateSeq, DataSize, Status} = fabric2_fdb:transactional(Db, fun(TxDb) ->
-        Seq = couch_views_fdb:get_update_seq(TxDb, Mrst),
-        DataSize = get_total_view_size(TxDb, Mrst),
-        JobStatus = case couch_views_jobs:job_state(TxDb, Mrst) of
+        Mrst1 = couch_views_fdb:set_trees(TxDb, Mrst),
+        Seq = couch_views_fdb:get_update_seq(TxDb, Mrst1),
+        DataSize = get_total_view_size(TxDb, Mrst1),
+        JobStatus = case couch_views_jobs:job_state(TxDb, Mrst1) of
             {ok, pending} -> true;
             {ok, running} -> true;
             {ok, finished} -> false;
@@ -124,10 +125,9 @@ get_info(Db, DDoc) ->
 
 
 get_total_view_size(TxDb, Mrst) ->
-    ViewIds = [View#mrview.id_num || View <- Mrst#mrst.views],
-    lists:foldl(fun (ViewId, Total) ->
-        Total + couch_views_fdb:get_kv_size(TxDb, Mrst, ViewId)
-    end, 0, ViewIds).
+    lists:foldl(fun(View, Total) ->
+        Total + couch_views_fdb:get_kv_size(TxDb, View)
+    end, 0, Mrst#mrst.views).
 
 
 read_view(Db, Mrst, ViewName, Callback, Acc0, Args) ->
