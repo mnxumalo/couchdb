@@ -435,6 +435,9 @@ range(Db, #tree{} = Tree, StartKey, EndKey, AccFun, Acc0) ->
     end).
 
 
+range(_Tx, #tree{}, #node{level = 0, members = []}, _StartKey, _EndKey, _AccFun, Acc0) ->
+    Acc0;
+
 range(Tx, #tree{} = Tree, #node{level = 0} = Node, StartKey, EndKey, AccFun, Acc0) ->
     InRange = [{K, V} || {K, V} <- Node#node.members,
         less_than_or_equal(Tree, StartKey, K), less_than_or_equal(Tree, K, EndKey)],
@@ -467,6 +470,9 @@ reverse_range(Db, #tree{} = Tree, StartKey, EndKey, AccFun, Acc0) ->
         reverse_range(Tx, Tree, get_node(Tx, Tree, ?NODE_ROOT_ID), StartKey, EndKey, AccFun, Acc0)
     end).
 
+
+reverse_range(_Tx, #tree{}, #node{level = 0, members = []}, _StartKey, _EndKey, _AccFun, Acc0) ->
+    Acc0;
 
 reverse_range(Tx, #tree{} = Tree, #node{level = 0} = Node, StartKey, EndKey, AccFun, Acc0) ->
     InRange = [{K, V} || {K, V} <- Node#node.members,
