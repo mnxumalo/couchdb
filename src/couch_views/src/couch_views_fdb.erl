@@ -241,6 +241,93 @@ fold_map_idx(TxDb, View, Options, Callback, Acc0) ->
     end.
 
 
+fold_red_idx(TxDb, View, Idx, Language, Options, Callback, Acc0) ->
+    #{
+        tx := Tx
+    } = TxDb,
+    #mrview{
+        btree = Btree
+    } = View,
+
+    CollateFun = collate_fun(View),
+
+    Dir = case lists:keyfind(dir, 1, Options) of
+        {dir, D} -> D;
+        _ -> fwd
+    end,
+
+    InclusiveEnd = case lists:keyfind(inclusive_end, 1, Options) of
+        {inclusive_end, IE} -> IE;
+        _ -> true
+    end,
+
+    StartKey = case lists:keyfind(start_key, 1, Options) of
+        {start_key, SK} -> SK;
+        false when Dir == fwd -> ebtree:min();
+        false when Dir == rev -> ebtree:max()
+    end,
+
+    EndKey = case lists:keyfind(end_key, 1, Options) of
+        {end_key, EK} -> EK;
+        false when Dir == fwd -> ebtree:max();
+        false when Dir == rev -> ebtree:min()
+    end,
+
+    Wrapper = fun(KVs0, WAcc) ->
+        % Remove any keys that match Start or End key
+        % depending on direction
+        KVs1 = case InclusiveEnd of
+            true ->
+                KVs0;
+            false when Dir == fwd ->
+                lists:filter(fun({K, _V}) ->
+                    case CollateFun(K, EndKey) of
+                        true ->
+                            % K =< EndKey
+                            case CollateFun(EndKey, K) of
+                                true ->
+                                    % K == EndKey, so reject
+                                    false;
+                                false ->
+                                    % K < EndKey, so include
+                                    true
+                            end;
+                        false when Dir == fwd ->
+                            % K > EndKey, should never happen, but reject
+                            false
+                    end
+                end, KVs0);
+            false when Dir == rev ->
+                lists:filter(fun({K, _V}) ->
+                    % In reverse, if K =< EndKey, we drop it
+                    not CollateFun(K, EndKey)
+                end, KVs0)
+        end,
+        % Expand dups
+        KVs2 = lists:flatmap(fun({K, V}) ->
+            case V of
+                {dups, Dups} when Dir == fwd ->
+                    [{K, D} || D <- Dups];
+                {dups, Dups} when Dir == rev ->
+                    [{K, D} || D <- lists:reverse(Dups)];
+                _ ->
+                    [{K, V}]
+            end
+        end, KVs1),
+        lists:foldl(fun({{Key, DocId}, Value}, WAccInner) ->
+            Callback(DocId, Key, Value, WAccInner)
+        end, WAcc, KVs2)
+    end,
+
+    case Dir of
+        fwd ->
+            ebtree:range(Tx, Btree, StartKey, EndKey, Wrapper, Acc0);
+        rev ->
+            % Start/End keys swapped on purpose because ebtree
+            ebtree:reverse_range(Tx, Btree, EndKey, StartKey, Wrapper, Acc0)
+    end.
+
+
 write_doc(TxDb, Mrst, #{deleted := true} = Doc) ->
     #{
         tx := Tx

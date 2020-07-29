@@ -23,7 +23,15 @@
 -include_lib("fabric/include/fabric2.hrl").
 
 
-read(Db, Mrst0, ViewName, UserCallback, UserAcc0, Args) ->
+read(Db, Mrst, ViewName, UserCallback, UserAcc, Args) ->
+    ReadFun = case Args of
+        #mrargs{view_type = map} -> fun read_map_view/6;
+        #mrargs{view_type = red} -> fun read_red_view/6
+    end,
+    ReadFun(Db, Mrst, ViewName, UserCallback, UserAcc, Args).
+
+
+read_map_view(Db, Mrst0, ViewName, UserCallback, UserAcc0, Args) ->
     try
         fabric2_fdb:transactional(Db, fun(TxDb) ->
             #mrst{
@@ -31,10 +39,10 @@ read(Db, Mrst0, ViewName, UserCallback, UserAcc0, Args) ->
                 views = Views
             } = Mrst = couch_views_fdb:set_trees(TxDb, Mrst0),
 
-            View = get_view(Lang, Args, ViewName, Views),
+            View = get_map_view(Lang, Args, ViewName, Views),
             Fun = fun handle_row/4,
 
-            Meta = get_meta(TxDb, Mrst, View, Args),
+            Meta = get_map_meta(TxDb, Mrst, View, Args),
             UserAcc1 = maybe_stop(UserCallback(Meta, UserAcc0)),
 
             Acc0 = #{
@@ -68,14 +76,77 @@ read(Db, Mrst0, ViewName, UserCallback, UserAcc0, Args) ->
     end.
 
 
-get_meta(TxDb, Mrst, View, #mrargs{update_seq = true}) ->
+read_red_view(Db, Mrst0, ViewName, UserCallback, UserAcc0, Args) ->
+    try
+        fabric2_fdb:transactional(Db, fun(TxDb) ->
+            #mrst{
+                language = Lang,
+                views = Views
+            } = Mrst = couch_views_fdb:set_trees(TxDb, Mrst0),
+
+            {Idx, Lang, View} = get_red_view(Lang, Args, ViewName, Views),
+            Fun = fun handle_row/4,
+
+            Meta = get_red_meta(TxDb, Mrst, View, Args),
+            UserAcc1 = maybe_stop(UserCallback(Meta, UserAcc0)),
+
+            Acc0 = #{
+                db => TxDb,
+                skip => Args#mrargs.skip,
+                limit => Args#mrargs.limit,
+                mrargs => undefined,
+                red_idx => Idx,
+                language => Lang,
+                callback => UserCallback,
+                acc => UserAcc1
+            },
+
+            Acc1 = lists:foldl(fun(KeyArgs, KeyAcc0) ->
+                Opts = mrargs_to_fdb_options(KeyArgs),
+                KeyAcc1 = KeyAcc0#{
+                    mrargs := KeyArgs
+                },
+                couch_views_fdb:fold_red_idx(
+                        TxDb,
+                        View,
+                        Idx,
+                        Lang,
+                        Opts,
+                        Fun,
+                        KeyAcc1
+                    )
+            end, Acc0, expand_keys_args(Args)),
+
+            #{
+                acc := UserAcc2
+            } = Acc1,
+            {ok, maybe_stop(UserCallback(complete, UserAcc2))}
+        end)
+    catch
+        throw:{complete, Out} ->
+            {_, Final} = UserCallback(complete, Out),
+            {ok, Final};
+        throw:{done, Out} ->
+            {ok, Out}
+    end.
+
+
+get_map_meta(TxDb, Mrst, View, #mrargs{update_seq = true}) ->
     TotalRows = couch_views_fdb:get_row_count(TxDb, View),
     ViewSeq = couch_views_fdb:get_update_seq(TxDb, Mrst),
     {meta,  [{update_seq, ViewSeq}, {total, TotalRows}, {offset, null}]};
 
-get_meta(TxDb, _Mrst, View, #mrargs{}) ->
+get_map_meta(TxDb, _Mrst, View, #mrargs{}) ->
     TotalRows = couch_views_fdb:get_row_count(TxDb, View),
     {meta, [{total, TotalRows}, {offset, null}]}.
+
+
+get_red_meta(TxDb, Mrst, _View, #mrargs{update_seq = true}) ->
+    ViewSeq = couch_views_fdb:get_update_seq(TxDb, Mrst),
+    {meta,  [{update_seq, ViewSeq}]};
+
+get_red_meta(_TxDb, _Mrst, _View, #mrargs{}) ->
+    {meta, []}.
 
 
 handle_row(_DocId, _Key, _Value, #{skip := Skip} = Acc) when Skip > 0 ->
@@ -115,10 +186,17 @@ handle_row(DocId, Key, Value, Acc) ->
     Acc#{limit := Limit - 1, acc := UserAcc1}.
 
 
-get_view(Lang, Args, ViewName, Views) ->
+get_map_view(Lang, Args, ViewName, Views) ->
     case couch_mrview_util:extract_view(Lang, Args, ViewName, Views) of
         {map, View, _Args} -> View;
-        {red, {_Idx, _Lang, View}} -> View
+        {red, {Idx, Lang, View} = RedView} -> RedView
+    end.
+
+
+get_red_view(Lang, Args, ViewName, Views) ->
+    case couch_mrview_util:extract_view(Lang, Args, ViewName, Views) of
+        {red, {Idx, Lang, View}} -> {Idx, Lang, View};
+        _ -> throw({not_found, missing_named_view})
     end.
 
 
