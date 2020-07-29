@@ -40,7 +40,7 @@ read_map_view(Db, Mrst0, ViewName, UserCallback, UserAcc0, Args) ->
             } = Mrst = couch_views_fdb:set_trees(TxDb, Mrst0),
 
             View = get_map_view(Lang, Args, ViewName, Views),
-            Fun = fun handle_row/4,
+            Fun = fun handle_map_row/4,
 
             Meta = get_map_meta(TxDb, Mrst, View, Args),
             UserAcc1 = maybe_stop(UserCallback(Meta, UserAcc0)),
@@ -84,17 +84,30 @@ read_red_view(Db, Mrst0, ViewName, UserCallback, UserAcc0, Args) ->
                 views = Views
             } = Mrst = couch_views_fdb:set_trees(TxDb, Mrst0),
 
+            #mrargs{
+                extra = Extra
+            } = Args,
+
             {Idx, Lang, View} = get_red_view(Lang, Args, ViewName, Views),
-            Fun = fun handle_row/4,
+            Fun = fun handle_red_row/3,
 
             Meta = get_red_meta(TxDb, Mrst, View, Args),
             UserAcc1 = maybe_stop(UserCallback(Meta, UserAcc0)),
+
+            Finalizer = case couch_util:get_value(finalizer, Extra) of
+                undefined ->
+                    {_, FunSrc} = lists:nth(Idx, View#mrview.reduce_funs),
+                    FunSrc;
+                CustomFun->
+                    CustomFun
+            end,
 
             Acc0 = #{
                 db => TxDb,
                 skip => Args#mrargs.skip,
                 limit => Args#mrargs.limit,
                 mrargs => undefined,
+                finalizer => Finalizer,
                 red_idx => Idx,
                 language => Lang,
                 callback => UserCallback,
@@ -110,7 +123,6 @@ read_red_view(Db, Mrst0, ViewName, UserCallback, UserAcc0, Args) ->
                         TxDb,
                         View,
                         Idx,
-                        Lang,
                         Opts,
                         Fun,
                         KeyAcc1
@@ -149,13 +161,13 @@ get_red_meta(_TxDb, _Mrst, _View, #mrargs{}) ->
     {meta, []}.
 
 
-handle_row(_DocId, _Key, _Value, #{skip := Skip} = Acc) when Skip > 0 ->
+handle_map_row(_DocId, _Key, _Value, #{skip := Skip} = Acc) when Skip > 0 ->
     Acc#{skip := Skip - 1};
 
-handle_row(_DocID, _Key, _Value, #{limit := 0, acc := UserAcc}) ->
+handle_map_row(_DocID, _Key, _Value, #{limit := 0, acc := UserAcc}) ->
     throw({complete, UserAcc});
 
-handle_row(DocId, Key, Value, Acc) ->
+handle_map_row(DocId, Key, Value, Acc) ->
     #{
         db := TxDb,
         limit := Limit,
@@ -186,16 +198,48 @@ handle_row(DocId, Key, Value, Acc) ->
     Acc#{limit := Limit - 1, acc := UserAcc1}.
 
 
+handle_red_row(_Key, _Red, #{skip := Skip} = Acc) when Skip > 0 ->
+    Acc#{skip := Skip - 1};
+
+handle_red_row(_Key, _Value, #{limit := 0, acc := UserAcc}) ->
+    throw({complete, UserAcc});
+
+handle_red_row(Key0, Value0, Acc) ->
+    #{
+        limit := Limit,
+        finalizer := Finalizer,
+        callback := UserCallback,
+        acc := UserAcc0
+    } = Acc,
+
+    Key1 = case Key0 of
+        group_exact -> null;
+        _ -> Key0
+    end,
+    Value1 = maybe_finalize(Finalizer, Value0),
+    Row = [{key, Key1}, {value, Value1}],
+
+    UserAcc1 = maybe_stop(UserCallback({row, Row}, UserAcc0)),
+    Acc#{limit := Limit - 1, acc := UserAcc1}.
+
+
+maybe_finalize(null, Red) ->
+    Red;
+maybe_finalize(Finalizer, Red) ->
+    {ok, Finalized} = couch_query_servers:finalize(Finalizer, Red),
+    Finalized.
+
+
 get_map_view(Lang, Args, ViewName, Views) ->
     case couch_mrview_util:extract_view(Lang, Args, ViewName, Views) of
         {map, View, _Args} -> View;
-        {red, {Idx, Lang, View} = RedView} -> RedView
+        {red, {_Idx, _Lang, View}} -> View
     end.
 
 
 get_red_view(Lang, Args, ViewName, Views) ->
     case couch_mrview_util:extract_view(Lang, Args, ViewName, Views) of
-        {red, {Idx, Lang, View}} -> {Idx, Lang, View};
+        {red, {Idx, Lang, View}, _Args} -> {Idx, Lang, View};
         _ -> throw({not_found, missing_named_view})
     end.
 
@@ -214,12 +258,14 @@ expand_keys_args(#mrargs{keys = Keys} = Args) ->
 
 mrargs_to_fdb_options(Args) ->
     #mrargs{
+        view_type = ViewType,
         start_key = StartKey,
         start_key_docid = StartKeyDocId,
         end_key = EndKey,
         end_key_docid = EndKeyDocId0,
         direction = Direction,
-        inclusive_end = InclusiveEnd
+        inclusive_end = InclusiveEnd,
+        group_level = GroupLevel
     } = Args,
 
     StartKeyOpts = if StartKey == undefined -> []; true ->
@@ -238,10 +284,33 @@ mrargs_to_fdb_options(Args) ->
         [{end_key, {EndKey, EndKeyDocId}}]
     end,
 
+    GroupFunOpt = make_group_key_fun(ViewType, GroupLevel),
+
     [
         {dir, Direction},
         {inclusive_end, InclusiveEnd}
-    ] ++ StartKeyOpts ++ EndKeyOpts.
+    ] ++ StartKeyOpts ++ EndKeyOpts ++ GroupFunOpt.
+
+
+make_group_key_fun(map, _) ->
+    [];
+
+make_group_key_fun(red, exact) ->
+    [
+        {group_key_fun, fun({Key, _DocId}) -> Key end}
+    ];
+
+make_group_key_fun(red, 0) ->
+    [
+        {group_key_fun, fun({_Key, _DocId}) -> group_exact end}
+    ];
+
+make_group_key_fun(red, N) when is_integer(N), N > 0 ->
+    GKFun = fun
+        ({Key, _DocId}) when is_list(Key) -> lists:sublist(Key, N);
+        ({Key, _DocId}) -> Key
+    end,
+    [{group_key_fun, GKFun}].
 
 
 maybe_stop({ok, Acc}) -> Acc;

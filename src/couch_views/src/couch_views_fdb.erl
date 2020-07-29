@@ -28,6 +28,7 @@
     get_kv_size/2,
 
     fold_map_idx/5,
+    fold_red_idx/6,
 
     write_doc/3,
 
@@ -128,13 +129,15 @@ set_update_seq(TxDb, Sig, Seq) ->
     ok = erlfdb:set(Tx, seq_key(DbPrefix, Sig), Seq).
 
 
-set_trees(TxDb, Mrst0) ->
-    Mrst1 = open_id_tree(TxDb, Mrst0),
-    Views = lists:map(fun(View) ->
-        open_view_tree(TxDb, Mrst1#mrst.sig, View)
-    end, Mrst1#mrst.views),
-    Mrst1#mrst{
+set_trees(TxDb, Mrst) ->
+    #mrst{
+        sig = Sig,
+        language = Lang,
         views = Views
+    } = Mrst,
+    Mrst#mrst{
+        id_btree = open_id_tree(TxDb, Sig),
+        views = [open_view_tree(TxDb, Sig, Lang, V) || V <- Views]
     }.
 
 
@@ -162,29 +165,9 @@ fold_map_idx(TxDb, View, Options, Callback, Acc0) ->
         btree = Btree
     } = View,
 
-    CollateFun = collate_fun(View),
+    CollateFun = couch_views_util:collate_fun(View),
 
-    Dir = case lists:keyfind(dir, 1, Options) of
-        {dir, D} -> D;
-        _ -> fwd
-    end,
-
-    InclusiveEnd = case lists:keyfind(inclusive_end, 1, Options) of
-        {inclusive_end, IE} -> IE;
-        _ -> true
-    end,
-
-    StartKey = case lists:keyfind(start_key, 1, Options) of
-        {start_key, SK} -> SK;
-        false when Dir == fwd -> ebtree:min();
-        false when Dir == rev -> ebtree:max()
-    end,
-
-    EndKey = case lists:keyfind(end_key, 1, Options) of
-        {end_key, EK} -> EK;
-        false when Dir == fwd -> ebtree:max();
-        false when Dir == rev -> ebtree:min()
-    end,
+    {Dir, StartKey, EndKey, InclusiveEnd} = to_map_opts(Options),
 
     Wrapper = fun(KVs0, WAcc) ->
         % Remove any keys that match Start or End key
@@ -241,7 +224,7 @@ fold_map_idx(TxDb, View, Options, Callback, Acc0) ->
     end.
 
 
-fold_red_idx(TxDb, View, Idx, Language, Options, Callback, Acc0) ->
+fold_red_idx(TxDb, View, Idx, Options, Callback, Acc0) ->
     #{
         tx := Tx
     } = TxDb,
@@ -249,82 +232,46 @@ fold_red_idx(TxDb, View, Idx, Language, Options, Callback, Acc0) ->
         btree = Btree
     } = View,
 
-    CollateFun = collate_fun(View),
+    {Dir, StartKey, EndKey, InclusiveEnd, GroupKeyFun} = to_red_opts(Options),
 
-    Dir = case lists:keyfind(dir, 1, Options) of
-        {dir, D} -> D;
-        _ -> fwd
-    end,
-
-    InclusiveEnd = case lists:keyfind(inclusive_end, 1, Options) of
-        {inclusive_end, IE} -> IE;
-        _ -> true
-    end,
-
-    StartKey = case lists:keyfind(start_key, 1, Options) of
-        {start_key, SK} -> SK;
-        false when Dir == fwd -> ebtree:min();
-        false when Dir == rev -> ebtree:max()
-    end,
-
-    EndKey = case lists:keyfind(end_key, 1, Options) of
-        {end_key, EK} -> EK;
-        false when Dir == fwd -> ebtree:max();
-        false when Dir == rev -> ebtree:min()
-    end,
-
-    Wrapper = fun(KVs0, WAcc) ->
-        % Remove any keys that match Start or End key
-        % depending on direction
-        KVs1 = case InclusiveEnd of
-            true ->
-                KVs0;
-            false when Dir == fwd ->
-                lists:filter(fun({K, _V}) ->
-                    case CollateFun(K, EndKey) of
-                        true ->
-                            % K =< EndKey
-                            case CollateFun(EndKey, K) of
-                                true ->
-                                    % K == EndKey, so reject
-                                    false;
-                                false ->
-                                    % K < EndKey, so include
-                                    true
-                            end;
-                        false when Dir == fwd ->
-                            % K > EndKey, should never happen, but reject
-                            false
-                    end
-                end, KVs0);
-            false when Dir == rev ->
-                lists:filter(fun({K, _V}) ->
-                    % In reverse, if K =< EndKey, we drop it
-                    not CollateFun(K, EndKey)
-                end, KVs0)
-        end,
-        % Expand dups
-        KVs2 = lists:flatmap(fun({K, V}) ->
-            case V of
-                {dups, Dups} when Dir == fwd ->
-                    [{K, D} || D <- Dups];
-                {dups, Dups} when Dir == rev ->
-                    [{K, D} || D <- lists:reverse(Dups)];
-                _ ->
-                    [{K, V}]
-            end
-        end, KVs1),
-        lists:foldl(fun({{Key, DocId}, Value}, WAccInner) ->
-            Callback(DocId, Key, Value, WAccInner)
-        end, WAcc, KVs2)
+    Wrapper = fun({GroupKey, Reduction}, WAcc) ->
+        {_RowCount, _RowSize, UserReds} = Reduction,
+        RedValue = lists:nth(Idx, UserReds),
+        Callback(GroupKey, RedValue, WAcc)
     end,
 
     case Dir of
         fwd ->
-            ebtree:range(Tx, Btree, StartKey, EndKey, Wrapper, Acc0);
+            EBtreeOpts = [
+                {dir, fwd},
+                {inclusive_end, InclusiveEnd}
+            ],
+            ebtree:group_reduce(
+                    Tx,
+                    Btree,
+                    StartKey,
+                    EndKey,
+                    GroupKeyFun,
+                    Wrapper,
+                    Acc0,
+                    EBtreeOpts
+                );
         rev ->
             % Start/End keys swapped on purpose because ebtree
-            ebtree:reverse_range(Tx, Btree, EndKey, StartKey, Wrapper, Acc0)
+            EBtreeOpts = [
+                {dir, rev},
+                {inclusive_end, InclusiveEnd}
+            ],
+            ebtree:group_reduce(
+                    Tx,
+                    Btree,
+                    EndKey,
+                    StartKey,
+                    GroupKeyFun,
+                    Wrapper,
+                    Acc0,
+                    EBtreeOpts
+                )
     end.
 
 
@@ -439,18 +386,16 @@ get_view_keys(TxDb, Mrst, DocId) ->
     end.
 
 
-open_id_tree(TxDb, #mrst{sig = Sig} = Mrst) ->
+open_id_tree(TxDb, Sig) ->
     #{
         tx := Tx,
         db_prefix := DbPrefix
     } = TxDb,
     Prefix = id_tree_prefix(DbPrefix, Sig),
-    Mrst#mrst{
-        id_btree = ebtree:open(Tx, Prefix, 10, [])
-    }.
+    ebtree:open(Tx, Prefix, 10, []).
 
 
-open_view_tree(TxDb, Sig, View) ->
+open_view_tree(TxDb, Sig, Lang, View) ->
     #{
         tx := Tx,
         db_prefix := DbPrefix
@@ -460,62 +405,87 @@ open_view_tree(TxDb, Sig, View) ->
     } = View,
     Prefix = view_tree_prefix(DbPrefix, Sig, ViewId),
     TreeOpts = [
-        {collate_fun, collate_fun(View)},
-        {reduce_fun, make_reduce_fun(View)}
+        {collate_fun, couch_views_util:collate_fun(View)},
+        {reduce_fun, make_reduce_fun(Lang, View)}
     ],
     View#mrview{
         btree = ebtree:open(Tx, Prefix, 10, TreeOpts)
     }.
 
 
-collate_fun(View) ->
-    #mrview{
-        options = Options
-    } = View,
-    case couch_util:get_value(<<"collation">>, Options) of
-        <<"raw">> -> fun erlang:'=<'/2;
-        _ -> fun collate_rows/2
-    end.
-
-
-collate_rows({KeyA, DocIdA}, {KeyB, DocIdB}) ->
-    case couch_ejson_compare:less(KeyA, KeyB) of
-        -1 -> lt;
-        0 when DocIdA < DocIdB -> lt;
-        0 when DocIdA == DocIdB -> eq;
-        0 -> gt; % when DocIdA > DocIdB
-        1 -> gt
-    end.
-
-
-make_reduce_fun(#mrview{}) ->
+make_reduce_fun(Lang, #mrview{} = View) ->
+    RedFuns = [Src || {_, Src} <- View#mrview.reduce_funs],
     fun
-        (KVs, _ReReduce = false) ->
-            TotalSize = lists:foldl(fun({K, V}, Acc) ->
+        (KVs0, _ReReduce = false) ->
+            KVs1 = detuple_kvs(expand_dupes(KVs0)),
+            TotalSize = lists:foldl(fun([K, V], Acc) ->
                 KSize = couch_ejson_size:encoded_size(K),
-                VSize = case V of
-                    {dups, Dups} ->
-                        lists:foldl(fun(D, DAcc) ->
-                            DAcc + couch_ejson_size:encoded_size(D)
-                        end, 0, Dups);
-                    _ ->
-                        couch_ejson_size:encoded_size(V)
-                end,
+                VSize = couch_ejson_size:encoded_size(V),
                 KSize + VSize + Acc
-            end, 0, KVs),
-            {length(KVs), TotalSize};
-        (KRs, _ReReduce = true) ->
-            lists:foldl(fun({Count, Size}, {CountAcc, SizeAcc}) ->
-                {Count + CountAcc, Size + SizeAcc}
-            end, {0, 0}, KRs)
-    end.
+            end, 0, KVs1),
+            {ok, UserReds} = couch_query_servers:reduce(Lang, RedFuns, KVs1),
+            {length(KVs1), TotalSize, UserReds};
+        (Reductions, _ReReduce = true) ->
+            FoldFun = fun({Count, Size, UserReds}, {CAcc, SAcc, URedAcc}) ->
+                NewCAcc = Count + CAcc,
+                NewSAcc = Size + SAcc,
+                NewURedAcc = [UserReds | URedAcc],
+                {NewCAcc, NewSAcc, NewURedAcc}
+            end,
+            InitAcc = {0, 0, []},
+            FinalAcc = lists:foldl(FoldFun, InitAcc, Reductions),
+            {FinalCount, FinalSize, UReds} = FinalAcc,
+            {ok, Result} = couch_query_servers:rereduce(Lang, RedFuns, UReds),
+            {FinalCount, FinalSize, Result}
+        end.
+
+
+to_map_opts(Options) ->
+    Dir = case lists:keyfind(dir, 1, Options) of
+        {dir, D} -> D;
+        _ -> fwd
+    end,
+
+    InclusiveEnd = case lists:keyfind(inclusive_end, 1, Options) of
+        {inclusive_end, IE} -> IE;
+        _ -> true
+    end,
+
+    StartKey = case lists:keyfind(start_key, 1, Options) of
+        {start_key, SK} -> SK;
+        false when Dir == fwd -> ebtree:min();
+        false when Dir == rev -> ebtree:max()
+    end,
+
+    EndKey = case lists:keyfind(end_key, 1, Options) of
+        {end_key, EK} -> EK;
+        false when Dir == fwd -> ebtree:max();
+        false when Dir == rev -> ebtree:min()
+    end,
+
+    {Dir, StartKey, EndKey, InclusiveEnd}.
+
+
+to_red_opts(Options) ->
+    {Dir, StartKey, EndKey, InclusiveEnd} = to_map_opts(Options),
+
+    GroupKeyFun = case lists:keyfind(group_key_fun, 1, Options) of
+        {group_key_fun, GKF} -> GKF;
+        false -> fun({_Key, _DocId}) -> global_group end
+    end,
+
+    {Dir, StartKey, EndKey, InclusiveEnd, GroupKeyFun}.
 
 
 dedupe_rows(View, KVs0) ->
-    CollateFun = collate_fun(View),
-    KVs1 = lists:sort(fun({KeyA, _}, {KeyB, _}) ->
-        CollateFun({KeyA, <<>>}, {KeyB, <<>>})
-    end, lists:sort(KVs0)),
+    CollateFun = couch_views_util:collate_fun(View),
+    KVs1 = lists:sort(fun({KeyA, ValA}, {KeyB, ValB}) ->
+        case CollateFun({KeyA, <<>>}, {KeyB, <<>>}) of
+            lt -> true;
+            eq -> ValA =< ValB;
+            gt -> false
+        end
+    end, KVs0),
     dedupe_rows_int(CollateFun, KVs1).
 
 
@@ -529,22 +499,9 @@ dedupe_rows_int(CollateFun, [{K1, V1} | RestKVs]) ->
     RestDeduped = dedupe_rows_int(CollateFun, RestKVs),
     case RestDeduped of
         [{K2, V2} | RestRestDeduped] ->
-            Equal = case CollateFun({K1, <<>>}, {K2, <<>>}) of
-                true ->
-                    case CollateFun({K2, <<>>}, {K1, <<>>}) of
-                        true ->
-                            true;
-                        false ->
-                            false
-                    end;
-                false ->
-                    false
-            end,
-            case Equal of
-                true ->
-                    [{K1, combine_vals(V1, V2)} | RestRestDeduped];
-                false ->
-                    [{K1, V1} | RestDeduped]
+            case CollateFun({K1, <<>>}, {K2, <<>>}) of
+                eq -> [{K1, combine_vals(V1, V2)} | RestRestDeduped];
+                _ -> [{K1, V1} | RestDeduped]
             end;
         [] ->
             [{K1, V1}]
@@ -555,6 +512,22 @@ combine_vals(V1, {dups, V2}) ->
     {dups, [V1 | V2]};
 combine_vals(V1, V2) ->
     {dups, [V1, V2]}.
+
+
+expand_dupes([]) ->
+    [];
+expand_dupes([{K, {dups, Dups}} | Rest]) ->
+    Expanded = [{K, D} || D <- Dups],
+    Expanded ++ expand_dupes(Rest);
+expand_dupes([{K, V} | Rest]) ->
+    [{K, V} | expand_dupes(Rest)].
+
+
+detuple_kvs([]) ->
+    [];
+detuple_kvs([KV | Rest]) ->
+    {{Key, Id}, Value} = KV,
+    [[[Key, Id], Value] | detuple_kvs(Rest)].
 
 
 id_tree_prefix(DbPrefix, Sig) ->
