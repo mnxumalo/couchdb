@@ -125,14 +125,14 @@ lookup(Db, #tree{} = Tree, Key) ->
         ({visit, K, V}, _Acc) when K =:= Key ->
             {stop, {K, V}};
         ({visit, K, _V}, Acc) ->
-            case greater_than(Tree, K, Key) of
+            case collate(Tree, K, Key, [gt]) of
                 true ->
                     {stop, Acc};
                 false ->
                     {ok, Acc}
             end;
         ({traverse, F, L, _R}, Acc) ->
-            case {greater_than(Tree, F, Key), less_than_or_equal(Tree, Key, L)} of
+            case {collate(Tree, F, Key, [gt]), collate(Tree, Key, L, [lt, eq])} of
                 {true, _} ->
                     {stop, Acc};
                 {false, true} ->
@@ -239,11 +239,34 @@ full_reduce(Db, #tree{} = Tree) ->
 %% @returns the reduce value for the specified range
 -spec reduce(Db :: term(), Tree :: #tree{}, StartKey :: term(), EndKey :: term()) -> term().
 reduce(Db, #tree{} = Tree, StartKey, EndKey) ->
+    reduce(Db, Tree, StartKey, EndKey, []).
+
+%% @doc Calculate the reduce value for all keys in the specified range.
+%% @param Db An erlfdb database or transaction.
+%% @param Tree The ebtree.
+%% @param StartKey The beginning of the range
+%% @param EndKey The end of the range
+%% @returns the reduce value for the specified range
+-spec reduce(Db :: term(), Tree :: #tree{}, StartKey :: term(),
+    EndKey :: term(), Options :: [reduce_option()]) -> term().
+reduce(Db, #tree{} = Tree, StartKey, EndKey, Options) ->
+    StartOptions = case proplists:get_value(inclusive_start, Options, true) of
+        true ->
+            [lt];
+        false ->
+            [lt, eq]
+    end,
+    EndOptions = case proplists:get_value(inclusive_end, Options, true) of
+        true ->
+            [gt];
+        false ->
+            [gt, eq]
+    end,
     Fun = fun
         ({visit, Key, Value}, {MapAcc, ReduceAcc}) ->
-            BeforeStart = less_than(Tree, Key, StartKey),
-            AfterEnd = greater_than(Tree, Key, EndKey),
-            InRange = greater_than_or_equal(Tree, Key, StartKey) andalso less_than_or_equal(Tree, Key, EndKey),
+            BeforeStart = collate(Tree, Key, StartKey, StartOptions),
+            AfterEnd = collate(Tree, Key, EndKey, EndOptions),
+            InRange = collate(Tree, Key, StartKey, [gt, eq]) andalso collate(Tree, Key, EndKey, [lt, eq]),
             if
                 BeforeStart ->
                     {ok, {MapAcc, ReduceAcc}};
@@ -253,9 +276,9 @@ reduce(Db, #tree{} = Tree, StartKey, EndKey) ->
                      {ok, {[{Key, Value} | MapAcc], ReduceAcc}}
             end;
         ({traverse, FirstKey, LastKey, Reduction}, {MapAcc, ReduceAcc}) ->
-            BeforeStart = less_than(Tree, LastKey, StartKey),
-            AfterEnd = greater_than(Tree, FirstKey, EndKey),
-            Whole = greater_than_or_equal(Tree, FirstKey, StartKey) andalso less_than_or_equal(Tree, LastKey, EndKey),
+            BeforeStart = collate(Tree, LastKey, StartKey, [lt]),
+            AfterEnd = collate(Tree, FirstKey, EndKey, [gt]),
+            Whole = collate(Tree, FirstKey, StartKey, [gt, eq]) andalso collate(Tree, LastKey, EndKey, [lt, eq]),
             if
                 BeforeStart ->
                     {skip, {MapAcc, ReduceAcc}};
@@ -304,7 +327,7 @@ group_reduce(Db, #tree{} = Tree, StartKey, EndKey, GroupKeyFun, UserAccFun, User
 %% @returns the final accumulator.
 -type group_key() :: term().
 
--type group_option() :: [{inclusive_start, boolean()} | {inclusive_end, boolean()}].
+-type reduce_option() :: [{inclusive_start, boolean()} | {inclusive_end, boolean()}].
 
 -spec group_reduce(
     Db :: term(),
@@ -314,7 +337,7 @@ group_reduce(Db, #tree{} = Tree, StartKey, EndKey, GroupKeyFun, UserAccFun, User
     GroupKeyFun :: fun((term()) -> group_key()),
     UserAccFun :: fun(({group_key(), GroupValue :: term()}, Acc0 :: term()) -> Acc1 :: term()),
     UserAcc0 :: term(),
-    Options :: [fold_option() | group_option()]) -> Acc1 :: term().
+    Options :: [fold_option() | reduce_option()]) -> Acc1 :: term().
 group_reduce(Db, #tree{} = Tree, StartKey, EndKey, GroupKeyFun, UserAccFun, UserAcc0, Options) ->
     Dir = proplists:get_value(dir, Options, fwd),
     InclusiveStart = proplists:get_value(inclusive_start, Options, true),
@@ -904,25 +927,45 @@ reduce_values(#tree{} = Tree, Values, Rereduce) when is_list(Values) ->
 
 %% collation functions
 
-collate(#tree{} = _Tree, ?MIN, _B, Allowed) ->
-    lists:member(lt, Allowed);
+in_range(#tree{} = Tree, StartOfRange, Key, EndOfRange, Options) ->
+    greater_than_or_equal(Tree, Key, StartOfRange) andalso less_than_or_equal(Tree, Key, EndOfRange).
 
-collate(#tree{} = _Tree, _A, ?MIN, Allowed) ->
-    lists:member(gt, Allowed);
 
-collate(#tree{} = _Tree, ?MAX, _B, Allowed) ->
-    lists:member(gt, Allowed);
+greater_than(#tree{} = Tree, A, B) ->
+    collate(Tree, A, B, [gt]).
 
-collate(#tree{} = _Tree, _A, ?MAX, Allowed) ->
-    lists:member(lt, Allowed);
 
-collate(#tree{} = Tree, A, B, Allowed) ->
+greater_than_or_equal(#tree{} = Tree, A, B) ->
+    collate(Tree, A, B, [gt, eq]).
+
+
+less_than(#tree{} = Tree, A, B) ->
+    collate(Tree, A, B, [lt]).
+
+
+less_than_or_equal(#tree{} = Tree, A, B) ->
+    collate(Tree, A, B, [lt, eq]).
+
+
+collate(#tree{} = _Tree, ?MIN, _B) ->
+    lt;
+
+collate(#tree{} = _Tree, _A, ?MIN) ->
+    gt;
+
+collate(#tree{} = _Tree, ?MAX, _B) ->
+    gt;
+
+collate(#tree{} = _Tree, _A, ?MAX) ->
+    lt;
+
+collate(#tree{} = Tree, A, B) ->
     #tree{collate_fun = CollateFun} = Tree,
     CollateFun(A, B).
 
+
 collate(#tree{} = Tree, A, B, Allowed) ->
-    #tree{collate_fun = CollateFun} = Tree,
-    lists:member(CollateFun(A, B), Allowed).
+    lists:member(collate(Tree, A, B), Allowed).
 
 
 umerge_members(#tree{} = Tree, List1, List2) ->
@@ -1084,16 +1127,9 @@ reduce_stats(Rs, true) ->
 collation_fun_test_() ->
     Tree = #tree{collate_fun = fun collate_raw/2},
     [
-        ?_test(?assert(greater_than(Tree, 4, 3))),
-        ?_test(?assertNot(greater_than(Tree, 3, 4))),
-        ?_test(?assert(greater_than_or_equal(Tree, 3, 3))),
-        ?_test(?assert(greater_than_or_equal(Tree, 3, 3))),
-        ?_test(?assert(less_than(Tree, 3, 4))),
-        ?_test(?assertNot(less_than(Tree, 3, 3))),
-        ?_test(?assertNot(less_than(Tree, 4, 3))),
-        ?_test(?assert(less_than_or_equal(Tree, 3, 3))),
-        ?_test(?assert(less_than_or_equal(Tree, 3, 4))),
-        ?_test(?assertNot(less_than_or_equal(Tree, 4, 3)))
+        ?_test(?assertEqual(gt, collate(Tree, 4, 3))),
+        ?_test(?assertEqual(lt, collate(Tree, 3, 4))),
+        ?_test(?assertEqual(eq, collate(Tree, 3, 3)))
     ].
 
 
