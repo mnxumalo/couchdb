@@ -213,7 +213,7 @@ handle_red_row(Key0, Value0, Acc) ->
     } = Acc,
 
     Key1 = case Key0 of
-        group_exact -> null;
+        undefined -> null;
         _ -> Key0
     end,
     Value1 = maybe_finalize(Finalizer, Value0),
@@ -302,7 +302,7 @@ make_group_key_fun(red, exact) ->
 
 make_group_key_fun(red, 0) ->
     [
-        {group_key_fun, fun({_Key, _DocId}) -> group_exact end}
+        {group_key_fun, fun({_Key, _DocId}) -> undefined end}
     ];
 
 make_group_key_fun(red, N) when is_integer(N), N > 0 ->

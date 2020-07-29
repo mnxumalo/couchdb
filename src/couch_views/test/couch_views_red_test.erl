@@ -42,10 +42,17 @@ map_views_test_() ->
             fun teardown/1,
             [
                 ?TDEF(should_reduce),
+                ?TDEF(should_reduce_rev),
                 ?TDEF(should_reduce_start_key),
+                ?TDEF(should_reduce_start_key_rev),
                 ?TDEF(should_reduce_end_key),
+                ?TDEF(should_reduce_end_key_rev),
+                ?TDEF(should_reduce_inclusive_end_false),
+                ?TDEF(should_reduce_inclusive_end_false_rev),
                 ?TDEF(should_reduce_start_and_end_key),
-                ?TDEF(should_reduce_empty_range)
+                ?TDEF(should_reduce_start_and_end_key_rev),
+                ?TDEF(should_reduce_empty_range),
+                ?TDEF(should_reduce_empty_range_rev)
             ]
         }
     }.
@@ -53,6 +60,15 @@ map_views_test_() ->
 
 should_reduce() ->
     Result = run_query(<<"baz_count">>, #{}),
+    Expect = {ok, [{row, [{key, null}, {value, 10}]}]},
+    ?assertEqual(Expect, Result).
+
+
+should_reduce_rev() ->
+    Args = #{
+        direction => rev
+    },
+    Result = run_query(<<"baz_count">>, Args),
     Expect = {ok, [{row, [{key, null}, {value, 10}]}]},
     ?assertEqual(Expect, Result).
 
@@ -66,12 +82,53 @@ should_reduce_start_key() ->
     ?assertEqual(Expect, Result).
 
 
+should_reduce_start_key_rev() ->
+    Args = #{
+        direction => rev,
+        start_key => 4
+    },
+    Result = run_query(<<"baz_count">>, Args),
+    Expect = {ok, [{row, [{key, null}, {value, 4}]}]},
+    ?assertEqual(Expect, Result).
+
+
 should_reduce_end_key() ->
     Args = #{
         end_key => 6
     },
     Result = run_query(<<"baz_count">>, Args),
     Expect = {ok, [{row, [{key, null}, {value, 6}]}]},
+    ?assertEqual(Expect, Result).
+
+
+should_reduce_end_key_rev() ->
+    Args = #{
+        direction => rev,
+        end_key => 6
+    },
+    Result = run_query(<<"baz_count">>, Args),
+    Expect = {ok, [{row, [{key, null}, {value, 5}]}]},
+    ?assertEqual(Expect, Result).
+
+
+should_reduce_inclusive_end_false() ->
+    Args = #{
+        end_key => 6,
+        inclusive_end => false
+    },
+    Result = run_query(<<"baz_count">>, Args),
+    Expect = {ok, [{row, [{key, null}, {value, 5}]}]},
+    ?assertEqual(Expect, Result).
+
+
+should_reduce_inclusive_end_false_rev() ->
+    Args = #{
+        direction => rev,
+        end_key => 6,
+        inclusive_end => false
+    },
+    Result = run_query(<<"baz_count">>, Args),
+    Expect = {ok, [{row, [{key, null}, {value, 4}]}]},
     ?assertEqual(Expect, Result).
 
 
@@ -85,9 +142,31 @@ should_reduce_start_and_end_key() ->
     ?assertEqual(Expect, Result).
 
 
+should_reduce_start_and_end_key_rev() ->
+    Args = #{
+        direction => rev,
+        start_key => 5,
+        end_key => 3
+    },
+    Result = run_query(<<"baz_count">>, Args),
+    Expect = {ok, [{row, [{key, null}, {value, 3}]}]},
+    ?assertEqual(Expect, Result).
+
+
 should_reduce_empty_range() ->
     Args = #{
         start_key => 100000,
+        end_key => 100001
+    },
+    Result = run_query(<<"baz_count">>, Args),
+    Expect = {ok, [{row, [{key, null}, {value, 0}]}]},
+    ?assertEqual(Expect, Result).
+
+
+should_reduce_empty_range_rev() ->
+    Args = #{
+        direction => rev,
+        start_key => 100001,
         end_key => 100000
     },
     Result = run_query(<<"baz_count">>, Args),

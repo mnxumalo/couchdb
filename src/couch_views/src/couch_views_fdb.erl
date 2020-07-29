@@ -257,10 +257,11 @@ fold_red_idx(TxDb, View, Idx, Options, Callback, Acc0) ->
                     EBtreeOpts
                 );
         rev ->
-            % Start/End keys swapped on purpose because ebtree
+            % Start/End keys swapped on purpose because ebtree. Also
+            % inclusive_start for same reason.
             EBtreeOpts = [
                 {dir, rev},
-                {inclusive_end, InclusiveEnd}
+                {inclusive_start, InclusiveEnd}
             ],
             ebtree:group_reduce(
                     Tx,
