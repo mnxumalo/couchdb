@@ -294,6 +294,9 @@ reduce(Db, #tree{} = Tree, StartKey, EndKey, Options) ->
     do_reduce(Tree, MapValues, ReduceValues).
 
 
+do_reduce(#tree{} = Tree, [], []) ->
+    reduce_values(Tree, [], false);
+
 do_reduce(#tree{} = Tree, [], ReduceValues) when is_list(ReduceValues) ->
     reduce_values(Tree, ReduceValues, true);
 
@@ -410,13 +413,12 @@ group_reduce(Db, #tree{} = Tree, StartKey, EndKey, GroupKeyFun, UserAccFun, User
             end
     end,
     {CurrentGroup, UserAcc1, MapValues, ReduceValues} = fold(Db, Tree, Fun, {NoGroupYet, UserAcc0, [], []}, Options),
-    if
-        MapValues /= [] orelse ReduceValues /= [] ->
-            FinalGroup = do_reduce(Tree, MapValues, ReduceValues),
-            UserAccFun({CurrentGroup, FinalGroup}, UserAcc1);
-        true ->
-            UserAcc1
-    end.
+    FinalGroupKey = case CurrentGroup of
+        NoGroupYet -> undefined;
+        _ -> CurrentGroup
+    end,
+    FinalGroupValue = do_reduce(Tree, MapValues, ReduceValues),
+    UserAccFun({FinalGroupKey, FinalGroupValue}, UserAcc1).
 
 
 %% @doc Finds all key-value pairs for the specified range in forward order.
