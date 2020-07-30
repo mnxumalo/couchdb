@@ -302,7 +302,7 @@ make_group_key_fun(red, exact) ->
 
 make_group_key_fun(red, 0) ->
     [
-        {group_key_fun, fun({_Key, _DocId}) -> undefined end}
+        {group_key_fun, group_all}
     ];
 
 make_group_key_fun(red, N) when is_integer(N), N > 0 ->
