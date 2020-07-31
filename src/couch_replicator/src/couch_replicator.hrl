@@ -65,12 +65,21 @@
 -define(DOC_ID, <<"doc_id">>).
 -define(ERROR_COUNT, <<"error_count">>).
 -define(LAST_UPDATED, <<"last_updated">>).
+-define(LAST_ERROR, <<"last_error">>).
 -define(JOB_HISTORY, <<"job_history">>).
+
+% Job history tags
+-define(HIST_TYPE, <<"type">>).
+-define(HIST_TIMESTAMP, <<"timestamp">>).
+-define(HIST_REASON, <<"reason">>).
+-define(HIST_ADDED, <<"added">>).
+-define(HIST_STARTED, <<"started">>).
+-difine(HIST_STOPPED, <<"stopped">>).
+-define(HIST_PENDING, <<"pending">>).
+-define(HIST_CRASHED, <<"crashed">>).
 
 -define(REP_DB_NAME, <<"_replicator">>).
 
-% Accepted job message tag
--define(ACCEPTED_JOB, accepted_job).
 
 
 -type rep_id() :: binary().
