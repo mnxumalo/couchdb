@@ -36,8 +36,8 @@
 -define(MAX_ACCEPTORS, 5).
 -define(MAX_JOBS, 500).
 -define(MAX_CHURN, 100).
--define(INTERVAL, 30).
--define(MIN_RUNTIME, 90).
+-define(INTERVAL_SEC, 30).
+-define(MIN_RUNTIME_SEC, 90).
 
 
 start_link() ->
@@ -181,7 +181,7 @@ stop_candidates(#{}, Top) when is_integer(Top), Top =< 0 ->
 stop_candidates(#{} = St, Top) when is_integer(Top), Top > 0 ->
     #{
         workers := Workers,
-        config := #{min_run_time := MinRunTime},
+        config := #{min_run_time_sec := MinRunTime},
     } = St,
 
     WList1 = maps:to_list(Workers), % [{Pid, {Normal, StartTime}},...]
@@ -252,7 +252,7 @@ get_config() ->
         interval_sec => ?INTERVAL_SEC,
         max_jobs => ?MAX_JOBS,
         max_churn => ?MAX_CHURN,
-        min_run_time => ?MIN_RUN_TIME
+        min_run_time_sec => ?MIN_RUN_TIME_SEC
     },
     maps:map(fun(K, Default) ->
         {K, config:get_integer("replicator", binary_to_list(K), Default)}
