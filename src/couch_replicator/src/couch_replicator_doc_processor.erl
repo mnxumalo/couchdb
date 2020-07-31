@@ -107,25 +107,24 @@ process_change(#{} = Db, #doc{deleted = false} = Doc) ->
     #doc{id = DocId, body = {Props} = Body} = Doc,
     DbName = fabric2_db:name(Db),
     DbUUID = fabric2_db:uuid(Db),
-    {Rep, Error} = try
+    {Rep, DocState, Error} = try
         Rep0 = couch_replicator_docs:parse_rep_doc(Body),
-        DocState = get_json_value(?REPLICATION_STATE, Props, null),
-        Rep1 = Rep0#{?DOC_STATE := DocState},
-        {Rep1, null}
+        DocState0 = get_json_value(?REPLICATION_STATE, Props, null),
+        {Rep0, DocState0, null}
     catch
         % This technically shouldn't happen as we've check if documents can be
         % parsed in the BDU
         throw:{bad_rep_doc, Reason} ->
-            {null, couch_replicator_utils:rep_error_to_binary(Reason)}
+            {null, null, couch_replicator_utils:rep_error_to_binary(Reason)}
     end,
     JobId = couch_replicator_ids:job_id(DbUUID, DocId),
     JobData = case Rep of
         null ->
             couch_relicator_jobs:new_job(Rep. DbName, DbUUID, DocId,
-                ?ST_FAILED, Error);
+                ?ST_FAILED, Error, null);
         #{} ->
             couch_replicator_jobs:new_job(Rep, DbName, DbUUID, DocId,
-                ?ST_INITIALIZING, null)
+                ?ST_INITIALIZING, null, DocState)
     end,
     couch_jobs_fdb:tx(couch_jobs_fdb:get_jtx(Db), fun(JTx) ->
         couch_replicate_jobs:get_job_data(JTx, JobId) of
