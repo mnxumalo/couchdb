@@ -14,29 +14,33 @@
 
 
 -export([
-    set_couch_jobs_timeout/0,
+    % couch_jobs type timeouts
+    set_timeout/0,
+    get_timeout/0,
 
-    new_job/5,
-
+    % Job creation and querying
+    new_job/7,
     add_job/3,
     remove_job/2,
     get_job_data/2,
-
     fold_jobs/3,
     pending_count/1,
     pending_count/2,
 
+    % Job subscription
     wait_for_result/1,
 
+    % Job execution
     accept_jobs/1,
-
     update_job_data/3,
     finish_job/3,
     reschedule_job/4,
 
-    update_replication_id/3,
-    get_job_id_by_rep_id/2,
-
+    % (..., ?REPLICATION_IDS) -> JobId handling
+    try_update_rep_id/3,
+    update_rep_id/3,
+    clear_old_rep_id/3,
+    get_job_id_by_rep_id/2
 ]).
 
 
@@ -44,7 +48,7 @@
 
 
 -define(REP_JOBS, <<"rep_jobs">>).
--define(REP_JOBS_TIMEOUT_MSEC, 33000).
+-define(REP_JOBS_TIMEOUT_SEC, 61).
 
 
 % Data model
@@ -61,11 +65,17 @@
 %   (?REPLICATION_IDS, RepId) -> JobId
 %
 
-set_couch_jobs_timeout() ->
-    couch_jobs:set_type_timeout(?REP_JOBS, ?REP_JOBS_TIMEOUT_MSEC).
+set_timeout() ->
+    couch_jobs:set_type_timeout(?REP_JOBS, ?REP_JOBS_TIMEOUT_SEC).
 
 
-new_job(#{} = Rep, DbName, DbUUID, DocId, State, StateInfo) ->
+get_timeout() ->
+    ?REP_JOBS_TIMEOUT_MSEC.
+
+
+new_job(#{} = Rep, DbName, DbUUID, DocId, State, StateInfo, DocState) ->
+    NowSec = erlang:system_time(second),
+    AddedEvent = #{?HIST_TYPE => ?HIST_ADDED, ?HIST_TIMESTAMP => NowSec},
     #{
         ?REP => Rep,
         ?REP_ID => null,
@@ -77,9 +87,11 @@ new_job(#{} = Rep, DbName, DbUUID, DocId, State, StateInfo) ->
         ?REP_STATS => #{},
         ?STATE => State,
         ?STATE_INFO => StateInfo,
-        ?LAST_UPDATED => erlang:system_time(),
-        ?LAST_FILTER_CHECK => 0,
-        ?JOB_HISTORY => []
+        ?DOC_STATE => DocState,
+        ?LAST_UPDATED_TIME => NowSec,
+        ?LAST_START_TIME => 0,
+        ?LAST_ERROR => null,
+        ?JOB_HISTORY => [AddedEvent]
     }.
 
 
@@ -156,7 +168,8 @@ accept_job(MaxSchedTime) when is_integer(MaxSchedTime) ->
     couch_jobs:accept(?REP_JOBS, Opts).
 
 
-update_job_data(Tx, #{} = Job, #{} = JobData) ->
+update_job_data(Tx, #{} = Job, #{} = JobData0) ->
+    JobData = JobData0#{?LAST_UPDATED_TIME := erlang:system_time(second)},
     couch_jobs_fdb:tx(couch_jobs_fdb:get_jtx(Tx), fun(JTx) ->
         couch_jobs:update(JTx, Job, JobData)
     end).
@@ -175,17 +188,43 @@ reschedule_job(Tx, #{} = Job, #{} = JobData, Time) is_integer(Time) ->
     end).
 
 
-update_replication_id(Tx, JobId, RepId) ->
+try_update_rep_id(Tx, JobId, RepId) ->
     couch_jobs_fdb:tx(couch_jobs_fdb:get_jtx(Tx), fun(JTx) ->
         #{tx := ErlFdbTx, layer_prefix := LayerPrefix} = JTx,
         Key = erlfdb_tuple:pack({?REPLICATION_IDS, RepId}, LayerPrefix),
-        case get_job_id(JTx, RepId) of
+        case get_job_id_by_rep_id(JTx, RepId) of
             {error, not_found} ->
                 ok = erlfdb:set(ErlFdbTx, Key, JobId);
             {ok, JobId} ->
                 ok;
-            {ok, CurJobId}} when is_binary(CurJobId) ->
-                {error, {replication_job_conflict, OldJobId}}
+            {ok, OtherJobId}} when is_binary(OtherJobId) ->
+                {error, {replication_job_conflict, OtherJobId}}
+        end
+    end).
+
+
+update_rep_id(Tx, JobId, RepId) ->
+    couch_jobs_fdb:tx(couch_jobs_fdb:get_jtx(Tx), fun(JTx) ->
+        #{tx := ErlFdbTx, layer_prefix := LayerPrefix} = JTx,
+        Key = erlfdb_tuple:pack({?REPLICATION_IDS, RepId}, LayerPrefix),
+        ok = erlfdb:set(ErlFdbTx, Key, JobId)
+    end).
+
+
+clear_old_rep_id(_, _, null) ->
+    ok;
+
+clear_old_rep_id(Tx, JobId, RepId) ->
+    couch_jobs_fdb:tx(couch_jobs_fdb:get_jtx(Tx), fun(JTx) ->
+        #{tx := ErlFdbTx, layer_prefix := LayerPrefix} = JTx,
+        Key = erlfdb_tuple:pack({?REPLICATION_IDS, RepId}, LayerPrefix),
+        case get_job_id_by_rep_id(JTx, RepId) of
+            {error, not_found} ->
+                ok = erlfdb:clear(ErlFdbTx, Key);
+            {ok, JobId} ->
+                ok = erlfdb:clear(ErlFdbTx, Key);
+            {ok, OtherJobId}} when is_binary(OtherJobId) ->
+                ok
         end
     end).
 
