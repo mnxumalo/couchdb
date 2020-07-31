@@ -203,7 +203,6 @@ parse_rep_doc(#{} = Doc, UserName) ->
             ?TARGET => Target,
             ?OPTIONS => Opts,
             ?REP_USER => UserName,
-            ?DOC_STATE => null,
             ?START_TIME => erlang:system_time()
         },
         {ok, Rep}
