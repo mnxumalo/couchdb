@@ -37,12 +37,9 @@
 -define(ST_ERROR, <<"error">>).
 -define(ST_COMPLETED, <<"completed">>).
 -define(ST_RUNNING, <<"running">>).
--define(ST_INITIALIZING, <<"initializing">>).
 -define(ST_FAILED, <<"failed">>).
 -define(ST_PENDING, <<"pending">>).
--define(ST_ERROR, <<"error">>).
 -define(ST_CRASHING, <<"crashing">>).
--define(ST_TRIGGERED, <<"triggered">>).  % Legacy state, used in docs only
 
 % Some fields from a rep object
 -define(REP_ID, <<"rep_id">>).
@@ -67,6 +64,7 @@
 -define(LAST_UPDATED, <<"last_updated">>).
 -define(LAST_ERROR, <<"last_error">>).
 -define(JOB_HISTORY, <<"job_history">>).
+-define(CHECKPOINT_HISTORY, <<"checkpoint_history">>).
 
 % Job history tags
 -define(HIST_TYPE, <<"type">>).
