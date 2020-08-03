@@ -91,7 +91,8 @@ new_job(#{} = Rep, DbName, DbUUID, DocId, State, StateInfo, DocState) ->
         ?LAST_UPDATED_TIME => NowSec,
         ?LAST_START_TIME => 0,
         ?LAST_ERROR => null,
-        ?JOB_HISTORY => [AddedEvent]
+        ?JOB_HISTORY => [AddedEvent],
+        ?CHECKPOINT_HISTORY => []
     }.
 
 
