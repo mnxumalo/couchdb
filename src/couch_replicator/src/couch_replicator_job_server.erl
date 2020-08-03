@@ -159,7 +159,7 @@ reschedule(#{} = St) ->
     couch_log:debug(LogMsg, [?MODULE, ChurnLeft, Pending, Slots, ToStart]),
 
     lists:foldl(fun(_, StAcc) ->
-        Pid = couch_replicator_scheduler_job:start_link(),
+        Pid = couch_replicator_job:start_link(),
         StAcc#{acceptors := Acceptors#{Pid => true}}
     end, St1, lists:seq(1, NeedAcceptors)).
 
@@ -212,7 +212,7 @@ spawn_acceptors(St) ->
     WCnt = maps:size(Workers),
     case ACnt < MaxAcceptors andalso (ACnt + WCnt) < MaxJobs of
         true ->
-            Pid = couch_replicator_scheduler_job:start_link(),
+            Pid = couch_replicator_job:start_link(),
             NewSt = St#{acceptors := Acceptors#{Pid => true}},
             spawn_acceptors(NewSt);
         false ->
