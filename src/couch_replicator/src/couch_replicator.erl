@@ -23,16 +23,23 @@
     restart_job/1
 ]).
 
--include_lib("couch/include/couch_db.hrl").
+% EPI callbacks
+-export([
+    after_db_create/2,
+    after_db_delete/2,
+    after_doc_write/6
+]).
+
+
+%-include_lib("couch/include/couch_db.hrl").
 -include("couch_replicator.hrl").
 -include_lib("couch_replicator/include/couch_replicator_api_wrap.hrl").
--include_lib("couch_mrview/include/couch_mrview.hrl").
--include_lib("mem3/include/mem3.hrl").
+%-include_lib("couch_mrview/include/couch_mrview.hrl").
+%-include_lib("mem3/include/mem3.hrl").
 
 -define(DESIGN_DOC_CREATION_DELAY_MSEC, 1000).
 -define(REPLICATION_STATES, [
     initializing,  % Just added to scheduler
-    error,         % Could not be turned into a replication job
     running,       % Scheduled and running
     pending,       % Scheduled and waiting to run
     crashing,      % Scheduled but crashing, backed off by the scheduler
@@ -74,7 +81,7 @@ replicate(PostBody, #user_ctx{name = UserName}) ->
 -spec start_transient_job(binary(), #{}) -> ok.
 start_transient_job(JobId, #{} = Rep) ->
     JobData = couch_replicator_jobs:new_job(Rep, null, null, null,
-        ?ST_INITIALIZING, null),
+        ?ST_PENDING, null, null),
     couch_jobs_fdb:tx(couch_jobs_fdb:get_jtx(Tx), fun(JTx) ->
         case couch_replicator_jobs:get_job_data(JTx, JobId) of
             {ok, #{?REP := OldRep}} ->
@@ -101,7 +108,11 @@ start_transient_job(JobId, #{} = Rep) ->
 ensure_rep_db_exists() ->
     case config:get_boolean("replicator", "create_replicator_db", false) of
         true ->
-            ok = couch_replicator_docs:ensure_rep_db_exists();
+            Opts = [?CTX, sys_db],
+            case fabric2_db:create(?REP_DB_NAME, [?CTX, sys_db]) of
+                {error, file_exists} -> ok;
+                {ok, _Db} -> ok
+            end
         false ->
             ok
     end,
@@ -128,6 +139,34 @@ cancel_replication(RepOrJobId) when is_binary(RepOrJobId) ->
                 {ok, {cancelled, RepOrJobId}}
         end
     ).
+
+
+% EPI db monitoring plugin callbacks
+
+after_db_create(DbName, DbUUID) when ?IS_REPLICATOR_DB(DbName)->
+    couch_stats:increment_counter([couch_replicator, docs, dbs_created]),
+    couch_replicator_doc_processor:add_jobs_from_db(DbName, DbUUID);
+
+after_db_create(_DbName, _DbUUID) ->
+    ok.
+
+
+after_db_delete(DbName, DbUUID) when ?IS_REPLICATOR_DB(DbName) ->
+    couch_stats:increment_counter([couch_replicator, docs, dbs_deleted]),
+    couch_replicator_doc_processor:remove_jobs_from_db(DbUUID);
+
+after_db_delete(_DbName, _DbUUID) ->
+    ok.
+
+
+after_doc_write(#{name := DbName} = Db, #doc{} = Doc, _NewWinner, _OldWinner,
+        _NewRevId, _Seq) when ?IS_REPLICATOR_DB(DbName) ->
+    couch_stats:increment_counter([couch_replicator, docs, db_changes]),
+    ok = couch_replicator_doc_processor:process_change(Db, Doc);
+
+after_doc_write(_Db, _Doc, _NewWinner, _OldWinner, _NewRevId, _Seq) ->
+    ok.
+
 
 
 -spec replication_states() -> [atom()].
@@ -272,7 +311,11 @@ info_from_doc(RepDb, {Props}) ->
 
 
 state_atom(<<"triggered">>) ->
-    triggered;  % This handles a legacy case were document wasn't converted yet
+    triggered;  % Legacy state
+state_atom(<<"error">>) ->
+    error; % Legacy state
+state_atom(<<"initializing">>) ->
+    initializing;
 state_atom(State) when is_binary(State) ->
     erlang:binary_to_existing_atom(State, utf8);
 state_atom(State) when is_atom(State) ->

@@ -23,15 +23,15 @@
 
 
 after_db_create(DbName, DbUUID) ->
-    couch_replicator_doc_processor:after_db_create(DbName, DbUUID),
+    couch_replicator:after_db_create(DbName, DbUUID),
     [DbName, DbUUID].
 
 
 after_db_delete(DbName, DbUUID) ->
-    couch_replicator_doc_processor:after_db_delete(DbName, DbUUID),
+    couch_replicator:after_db_delete(DbName, DbUUID),
     [DbName, DbUUID].
 
 
 after_doc_write(Db, Doc, NewWinner, OldWinner, NewRevId, Seq)->
-    couch_replicator_doc_processor:after_doc_write(Db, Doc, NewWinner, OldWinner, NewRevId, Seq),
+    couch_replicator:after_doc_write(Db, Doc, NewWinner, OldWinner, NewRevId, Seq),
     [Db, Doc, NewWinner, OldWinner, NewRevId, Seq].
