@@ -10,7 +10,7 @@
 % License for the specific language governing permissions and limitations under
 % the License.
 
--module(couch_replicator_scheduler_job).
+-module(couch_replicator_job).
 
 -behaviour(gen_server).
 
@@ -32,16 +32,10 @@
    format_status/2
 ]).
 
--include_lib("couch/include/couch_db.hrl").
--include_lib("couch_replicator/include/couch_replicator_api_wrap.hrl").
--include("couch_replicator_scheduler.hrl").
+%-include_lib("couch/include/couch_db.hrl").
+%-include_lib("couch_replicator/include/couch_replicator_api_wrap.hrl").
+%-include("couch_replicator_scheduler.hrl").
 -include("couch_replicator.hrl").
-
--import(couch_util, [
-    get_value/2,
-    get_value/3,
-    to_binary/1
-]).
 
 
 -define(LOWEST_SEQ, 0).
@@ -105,6 +99,33 @@ init(_) ->
     {ok, delayed_init, 0}.
 
 
+delayed_init() ->
+    couch_log:debug("~p : starting acceptor ", [?MODULE]),
+    {ok, Job1, JobData1} = accept(),
+    couch_log:debug("~p : accepted job ~p, initializing", [?MODULE, Job]),
+
+    % This may make a network request, then may fail and reschedule the job
+    {RepId, BaseId} = get_rep_id(JobData1),
+
+    {
+        ?REP := Rep,
+        ?DB_NAME := DbName,
+        ?DB_UUID := DbUUID,
+        ?DOC_ID := DocId
+    } = JobData1,
+
+    ok = couch_replicator_docs:remove_state_fields(DbName, DbUUID, DocId),
+
+    {Job3, JobData3} = couch_jobs_fdb:tx(couch_jobs_fdb:get_jtx(), fun(JTx) ->
+        finish_if_failed(JTx, Job1, JobData1),
+        {Job2, JobData2} = set_running_state(JTx, Job1, JobData1, RepId, BaseId),
+        assert_ownership(JTx, Job2, JobData2)
+    end),
+
+    State = #rep_state{} = do_init(Job3, JobData3),
+    {ok, State}.
+
+
 accept() ->
     NowSec = erlang:system_time(second),
     MaxSchedTime = NowSec + accept_jitter() div 1000},
@@ -124,28 +145,6 @@ accept() ->
     end.
 
 
-delayed_init() ->
-    couch_log:debug("~p : starting acceptor ", [?MODULE]),
-    {ok, Job1, JobData1} = accept(),
-    couch_log:debug("~p : accepted job ~p, initializing", [?MODULE, Job]),
-
-    % This may make a network request, then may fail and reschedule the job
-    {RepId, BaseId} = get_rep_id(JobData1),
-
-    {?REP : = Rep, ?STATE := LastState, ?STATE_INFO := LastInfo} = JobData1,
-    JobId = couch_replicator_ids:job_id(Rep),
-
-    {Job3, JobData3} = couch_jobs_fdb:tx(couch_jobs_fdb:get_jtx(), fun(JTx) ->
-        remove_old_state_fields(JobData1),
-        finish_if_failed(JTx, Job1, JobData1),
-        {Job2, JobData2} = set_running_state(JTx, Job1, JobData1, RepId, BaseId),
-        assert_ownership(JTx, Job2, JobData2)
-    end),
-
-    State = #rep_state{} = do_init(Job3, JobData3),
-    {ok, State}.
-
-
 do_init(Job, #{} = JobData) ->
     #rep_state{
         source = Source,
@@ -161,8 +160,8 @@ do_init(Job, #{} = JobData) ->
         db_name = DbName
     } = State = init_state(Job, JobData),
 
-    NumWorkers = get_value(worker_processes, Options),
-    BatchSize = get_value(worker_batch_size, Options),
+    NumWorkers = couch_util:get_value(worker_processes, Options),
+    BatchSize = couch_util:get_value(worker_batch_size, Options),
     {ok, ChangesQueue} = couch_work_queue:new([
         {max_items, BatchSize * NumWorkers * 2},
         {max_size, 100 * 1024 * NumWorkers}
@@ -178,7 +177,7 @@ do_init(Job, #{} = JobData) ->
     % This starts the worker processes. They ask the changes queue manager for a
     % a batch of _changes rows to process -> check which revs are missing in the
     % target, and for the missing ones, it copies them from the source to the target.
-    MaxConns = get_value(http_connections, Options),
+    MaxConns = couch_util:get_value(http_connections, Options),
     Workers = lists:map(
         fun(_) ->
             couch_stats:increment_counter([couch_replicator, workers_started]),
@@ -197,7 +196,7 @@ do_init(Job, #{} = JobData) ->
         {doc_id, DocId},
         {source, ?l2b(SourceName)},
         {target, ?l2b(TargetName)},
-        {continuous, get_value(continuous, Options, false)},
+        {continuous, couch_util:get_value(continuous, Options, false)},
         {source_seq, HighestSeq},
         {checkpoint_interval, CheckpointInterval}
     ] ++ rep_stats(State)),
@@ -205,8 +204,6 @@ do_init(Job, #{} = JobData) ->
 
     log_replication_start(State),
     couch_log:debug("Worker pids are: ~p", [Workers]),
-
-    doc_update_triggered(Rep),
 
     {ok, State#rep_state{
             changes_queue = ChangesQueue,
@@ -217,30 +214,21 @@ do_init(Job, #{} = JobData) ->
     }.
 
 
-finish_if_failed(Job, #{} = JobData) ->
+finish_if_failed(JTx, Job, #{} = JobData) ->
     case JobData of
         #{?REP := null, ?STATE := ?ST_FAILED, ?STATE_INFO := Error} ->
-            ok = fail_job(Job, JobData),
-            throw(finished);
+            ok = fail_job(JTx, Job, JobData),
+            exit({shutdown, finished});
         #{?REP := #{}} ->
             ok
     end.
 
 
 remove_old_state_fields(#{?DOC_STATE := DocState} = JobData) when
-        DocState =:= ?TRIGGERED orelse DocState =:= ?ERROR ->
-    case update_docs() of
-        true ->
-            ok;
-        false ->
-            #{?REP := Rep, ?DB_NAME := DbName, ?DOC_ID := DocId} = JobData,
-            case is_binary(DbName) andalso is_binary(DocId) of
-                true ->
-                    couch_replicator_docs:remove_state_fields(DbName, DocId);
-                false ->
-                    ok
-            end
-    end;
+        DocState =:= <<"triggered">> orelse DocState =:= <<"error">> ->
+    #{?DB_NAME := DbName, ?DB_UUID := DbUUID, ?DOC_ID := DocId} = JobData,
+    couch_replicator_docs:remove_state_fields(DbName, DbUUID, DocId),
+    ok.
 
 remove_old_state_fields(#{}) ->
     ok.
@@ -276,14 +264,16 @@ assert_ownership(#{jtx := true} = JTx, Job, JobData) ->
             ok;
         {error, {replication_job_conflict, OtherJobId}} ->
             case couch_replicator_jobs:get_job_data(JTx, OtherJobId) of
-                {ok, #{?STATE := ?ST_RUNNING}} ->
+                {ok, #{?STATE := S, ?DB_NAME := null}} when
+                        S == ?ST_RUNNING; S == ?ST_PENDING ->
                     Error = <<"Duplicate job running: ", OtherJobId/binary>>,
                     reschedule_job_on_error(JTx, Job, JobData, Error),
-                    throw(finished);
-                {ok, #{?STATE := ?ST_PENDING}} ->
-                    Error = <<"Duplicate job pending: ", OtherJobId/binary>>,
-                    reschedule_job_on_error(JTx, Job, JobData, Error),
-                    throw(finished);
+                    exit({shutdown, finished});
+                {ok, #{?STATE := S, ?DB_NAME := <<_/binary>>}} when
+                        S == ?ST_RUNNING; S == ?ST_PENDING ->
+                    Error = <<"Duplicate job running: ", OtherJobId/binary>>,
+                    fail_job(JTx, Job, JobData, Error),
+                    exit({shutdown, finished});
                 {ok, #{}} ->
                     LogMsg = "~p : Job ~p usurping job ~p for replication ~p",
                     couch_log:warning(LogMsg, [?MODULE, JobId, OtherJobId]),
@@ -299,29 +289,32 @@ assert_ownership(#{jtx := true} = JTx, Job, JobData) ->
 update_job_data(#{jtx := true} = JTx, Job, JobData) ->
     case couch_replicator_job:update_job_data(JTx, Job, JobData) of
         {ok, Job1} -> {Job1, JobData};
-        {error, halt} -> throw(halt)
+        {error, halt} -> exit({shutdown, halt})
     end.
 
 
 reschedule_job_on_error(JTx, Job, JobData0, Error0) ->
     NowSec = erlang:system_time(second),
-
     JobData = maybe_heal(JobData0, NowSec),
-
-    #{?ERROR_COUNT := ErrorCount, ?JOB_HISTORY := Hist} = JobData,
-    ErrorCount1 = ErrorCount + 1,
+    #{
+        ?ERROR_COUNT := ErrorCount,
+        ?JOB_HISTORY := Hist
+    } = JobData,
 
     Error = case Error0 of
         <<_/binary>> -> Error0;
         undefined -> undefined;
         null -> null;
+        Atom when is_atom(Atom) -> atom_to_binary(Atom, utf8);
+        {shutdown, Atom} when is_atom(Atom) -> atom_to_binary(Atom, utf8);
+        {shutdown, Err} -> couch_replicator_util:rep_error_to_binary(Err),
         Other -> couch_replicator_util:rep_error_to_binary(Error0)
     end,
 
     JobData1 = JobData#{
         ?STATE := ?ST_CRASHING,
         ?STATE_INFO := Error,
-        ?ERROR_COUNT := ErrorCount1,
+        ?ERROR_COUNT := ErrorCount + 1,
         ?LAST_ERROR := Error
     },
     JobData2 = hist_append(?HIST_CRASHED, NowSec, JobData1, Error),
@@ -334,7 +327,7 @@ reschedule_job_on_error(JTx, Job, JobData0, Error0) ->
     Time = get_backoff_time(ErrorCount1),
     case couch_replicator_job:reschedule_job(JTx, Job, JobData3, Time) of
         ok -> ok;
-        {error, halt} -> throw(halt)
+        {error, halt} -> exit({shutdown, halt})
     end.
 
 
@@ -355,27 +348,65 @@ reschedule_job(JTx, Job, JobData) ->
     Time = erlang:system_time(second),
     case couch_replicator_job:reschedule_job(JTx, Job, JobData3, Time) of
         ok -> ok;
-        {error, halt} -> throw(halt)
+        {error, halt} -> exit({shutdown, halt})
     end.
 
 
-fail_job(Job, JobData, Error) ->
-    NowSec = erlang:system_time(second),
-
-    #{?ERROR_COUNT := ErrorCount} = JobData,
+fail_job(JTx, Job, #{} = JobData, Error) ->
+    #{
+        ?ERROR_COUNT := ErrorCount,
+        ?DB_NAME := DbName,
+        ?DB_UUID := DbUUID,
+        ?DOC_ID := DocId
+    } = JobData,
 
     JobData1 = JobData#{
         ?STATE := ?ST_FAILED,
         ?STATE_INFO := Error,
-        ?ERROR_COUNT := ErrorCount + 1,
+        ?ERROR_COUNT := ErrorCount + 1
     },
 
-    JobData2 = hist_append(?HIST_CRASHED, NowSEc, JobDat1, Error),
+    NowSec = erlang:system_time(second),
+    JobData2 = hist_append(?HIST_CRASHED, NowSec, JobData1, Error),
 
-    % TODO: maybe delete transient jobs here
-    case couch_replicator_jobs:finish_job(undefined, Job, JobData2) of
-        ok -> ok;
-        {error, halt} -> throw(halt)
+    case couch_replicator_jobs:finish_job(JTx, Job, JobData2) of
+        ok ->
+            couch_replicator_doc:update_failed(DbName, DbUUID, DocId),
+            ok;
+        {error, halt} ->
+            exit({shutdown, halt})
+    end.
+
+
+complete_job(JTx, Job, JobData, CheckpointHistory) ->
+    #{
+        ?DB_NAME := DbName,
+        ?DB_UUID := DbUUID,
+        ?DOC_ID := DocId,
+        ?REP_STATS := RepStats,
+        ?REP := Rep
+    } = JobData,
+
+    #{?START_TIME := StartTime} = Rep,
+
+    JobData1 = JobData#{
+        ?STATE := ?ST_COMPLETED,
+        ?STATE_INFO := RepStats, % TODO: double-check this output
+        ?CHECKPOINT_HISTORY := CheckpointHistory
+    },
+
+    NowSec = erlang:system_time(second),
+    JobData2 = hist_append(?HIST_STOPPED, NowSec, JobData1, undefined),
+
+    case couch_replicator_jobs:finish_job(JTx, Job, JobData2) of
+        ok ->
+            StartTimeISO8601 = couch_replicator_utils:iso8601(StartTime),
+            DocStats = RepStats ++ [{start_time, StartTimeISO8601}],
+            couch_replicator_docs:update_doc_completed(DbName, DbUUID, DocID,
+                                                       DocStats),
+            ok;
+        {error, halt} ->
+            exit({shutdown, halt})
     end.
 
 
@@ -386,16 +417,17 @@ get_rep_id(JTx, Job, #{} = JobData) ->
     catch
         throw:{filter_fetch_error, Error} ->
             Error1 = io_lib:format("Filter fetch error ~p", [Error]),
-            Error2 = couch_util:to_binary(Error1),
-            reschedule_job_on_error(JTx, Job, JobData, Error2),
-            throw(finished)
+            reschedule_job_on_error(JTx, Job, JobData, Error1),
+            exit({shutdown, finished})
     end.
 
 
+% After job run continuously for some time we consider it "healed" and reset
+% its consecutive error count.
 maybe_heal_job(#{} = JobData, NowSec) ->
     #{?LAST_START_TIME := LastStartTime} = JobData,
     case NowSec - LastStartTime > health_threashold() of
-        true -> JobData#{?ERROR_COUNT := 0};
+        true -> JobData#{?ERROR_COUNT := 0, ?LAST_ERROR := null};
         false -> JobData
     end.
 
@@ -403,16 +435,12 @@ maybe_heal_job(#{} = JobData, NowSec) ->
 get_backoff_time(ErrorCount) ->
     Max = min(max_backoff_penalty_sec(), 3600 * 24 * 30),
     Min = max(min_backoff_penalty_sec(), 4),
-
     % Calculate the max exponent so exponentiation doesn't blow up
     MaxExp = math:log2(Max) - math:log2(Min),
-
     % This is the recommended backoff amount
     Wait = Min * math:pow(2, min(ErrCnt, MaxExp)),
-
     % Apply a 25% jitter to avoid a thundering herd effect
     WaitJittered = Wait * 0.75 + rand:uniform(trunc(Wait * 0.25) + 1),
-
     erlang:system_time(second) + trunc(WaitJittered).
 
 
@@ -577,23 +605,21 @@ handle_info({'EXIT', Pid, Reason}, #rep_state{workers = Workers} = State) ->
 
 handle_info(timeout, delayed_init) ->
     try delayed_init() of
-        {ok, State} ->
-            {noreply, State}
+        {ok, State} -> {noreply, State}
     catch
         exit:{http_request_failed, _, _, max_backoff} ->
-            {stop, {shutdown, max_backoff}, {error, max_backoff}};
-        throw:finished ->
-            {stop, {shutdown, finished}, finished};
-        throw:halt ->
-            {stop, {shutdown, halt}, halt};
+            Stack = lists:sublist(erlang:get_stacktrace(), 2),
+            {stop, {shutdown, max_backoff}, {init_error, Stack}};
+        exit:{shutdown, finished} ->
+            Stack = lists:sublist(erlang:get_stacktrace(), 2),
+            {stop, {shutdown, finished}, {init_error, Stack}};
+        exit:{shutdown, halt} ->
+            Stack = lists:sublist(erlang:get_stacktrace(), 2),
+            {stop, {shutdown, halt}, {init_error, Stack}};
         Class:Error ->
             ShutdownReason = {error, replication_start_error(Error)},
-            StackTop2 = lists:sublist(erlang:get_stacktrace(), 2),
-            % Shutdown state is a hack as it is not really the state of the
-            % gen_server (it failed to initialize, so it doesn't have one).
-            % Shutdown state is used to pass extra info about why start failed.
-            ShutdownState = {error, Class, StackTop2, _InitArgs = []},
-            {stop, {shutdown, ShutdownReason}, ShutdownState}
+            Stack = lists:sublist(erlang:get_stacktrace(), 2),
+            {stop, {shutdown, ShutdownReason}, {init_error, Stack}}
     end;
 
 
@@ -601,84 +627,73 @@ handle_info(Msg, St) ->
     {stop, {bad_info, Msg}, St}.
 
 
-terminate(normal, #rep_state{} = State) ->
-    % Note: when terminating `normal`, the job was already marked as finished.
-    % if that fails then we'd end up in the error terminate clause
-    terminate_cleanup(State).
+terminate(normal, #rep_state{} = State0) ->
+    State = cancel_timer(State0),
+    #rep_state{
+        job = Job,
+        db_name = DbName,
+        job_data = JobData,
+        checkpoint_history = History
+    } = State,
+    ok = complete_job(undefined, Job, JobData, History),
+    case DbName of
+        null ->
+            % Transient jobs are removed as soon as they completed. This is
+            % mainly to maintain compatibility with CouchDB <= 3.x
+            #{?REP := Rep}= JobData,
+            JobId = couch_replicator_ids:job_id(Rep),
+            couch_replicator_jobs:remove_job(undefined, JobId);
+        <<_/binary>> ->
+            ok
+    end,
+    close_endpoints(State).
 
-terminate(shutdown, #rep_state{id = RepId} = State) ->
-    % Replication stopped via _scheduler_sup:terminate_child/1, which can be
-    % occur during regular scheduler operation or when job is removed from
-    % the scheduler.
-    State1 = case do_checkpoint(State) of
-        {ok, NewState} ->
-            NewState;
+terminate(shutdown, #rep_state{} = State0) ->
+    % Replication stopped by the scheduler
+    State1 = cancel_timer(State0),
+    State3 = case do_checkpoint(State1) of
+        {ok, State2} ->
+            State2
         Error ->
-            LogMsg = "~p : Failed last checkpoint. Job: ~p Error: ~p",
-            couch_log:error(LogMsg, [?MODULE, RepId, Error]),
-            State
-    end,    finish_couch_job(State1, ?ST_PENDING, null),
-    terminate_cleanup(State1);
+            Msg = "~p : Failed last checkpoint. Job: ~p Error: ~p",
+            couch_log:error(Msg, [?MODULE, State1#rep_state.id, RepId, Error]),
+            State1
+    end,
+    #rep_state{job = Job, job_data = JobData} = State3,
+    ok = reschedule_job(undefined, Job, JobData),
+    ok = close_endpoints(State3);
 
-terminate({shutdown, finished}, finished) ->
-    couch_log:notice("~p : Job finished in init", [?MODULE]),
-    ok;
+terminate({shutdown, Error}, {init_error, Stack}) ->
+    % Termination in init, before the job had initialized
+    case Error of
+        max_backoff -> couch_log:warning("~p job backed off", [?MODULE]);
+        finished -> couch_log:notice("~p job finished in init", [?MODULE]);
+        _ -> couch_log:error("~p job failed ~p ~p", [?MODULE, Error, Stack])
+    end,
+    ok.
 
-terminate({shutdown, halt}, halt) ->
-    couch_log:error("~p : Replication job halted", [?MODULE]),
-    ok;
+terminate({shutdown, finished}, #rep_state{} = State) ->
+    % Job state was already updated and job is marked as finished
+    ok = close_endpoints(State);
 
-terminate({shutdown, max_backoff}, {error, {#{} = Job, #{} = JobData}}) ->
-    % Here we handle the case when replication fails during initialization.
-    % That is before the #rep_state{} is even built.
-    #{?REP_ID := RepId} = JobData,
-    couch_stats:increment_counter([couch_replicator, failed_starts]),
-    couch_log:warning("Replication `~s` reached max backoff ", [RepId]),
-    finish_couch_job(Job, JobData, <<"error">>, max_backoff);
+terminate({shutdown, halt}, #rep_state{} = State) ->
+    % Job is re-enqueued and possibly already running somewhere else
+    couch_log:error("~p job ~p halted", [?MODULE, State#rep_state.id]),
+    ok = close_endpoints(State);
 
-terminate({shutdown, {error, Error}}, {error, Class, Stack, {Job, JobData}}) ->
-    % Here we handle the case when replication fails during initialization.
-    #{
-        ?REP_ID := Id,
-        ?DB_NAME := DbName,
-        ?DOC_ID := DocId} = JobData,
-        ?REP := #{?SOURCE := Source0, ?TARGET := Target0}
-    } = JobData,
-    Source = couch_replicator_api_wrap:db_uri(Source0),
-    Target = couch_replicator_api_wrap:db_uri(Target0),
-    Msg = "~p:~p: Replication ~s failed to start ~p -> ~p doc ~p:~p stack:~p",
-    couch_log:error(Msg, [Class, Error, RepId, Source, Target, DbName,
-        DocId, Stack]),
-    couch_stats:increment_counter([couch_replicator, failed_starts]),
-    finish_couch_job(Job, JobData, <<"error">>, Error);
-
-terminate({shutdown, max_backoff}, #rep_state{} = State) ->
+terminate(Reason, #rep_state{} = State0) ->
+    State = update_job_state(State0),
     #rep_state{
         id = RepId,
+        job = Job,
+        job_data = JobData,
         source_name = Source,
         target_name = Target,
     } = State,
-    couch_log:error("Replication `~s` (`~s` -> `~s`) reached max backoff",
-        [RepId, Source, Target]),
-    terminate_cleanup(State),
-    finish_couch_job(State, <<"error">>, max_backoff);
-
-terminate(Reason, State) ->
-    #rep_state{
-        id = RepId,
-        source_name = Source,
-        target_name = Target,
-    } = State,
-    couch_log:error("Replication `~s` (`~s` -> `~s`) failed: ~s",
-        [RepId, Source, Target, to_binary(Reason)]),
-    terminate_cleanup(State),
-    finish_couch_job(State, <<"error">>, Reason).
-
-
-terminate_cleanup(State) ->
-    update_job_state(State),
-    couch_replicator_api_wrap:db_close(State#rep_state.source),
-    couch_replicator_api_wrap:db_close(State#rep_state.target).
+    couch_log:error("Replication `~s` (`~s` -> `~s`) failed: ~p",
+        [RepId, Source, Target, Reason]),
+    ok = reschedule_job_on_error(undefined, Job, JobData, Reason)
+    ok = close_endpoints(State).
 
 
 code_change(_OldVsn, #rep_state{}=State, _Extra) ->
@@ -717,6 +732,7 @@ format_status(_Opt, [_PDict, State]) ->
 
 headers_strip_creds([], Acc) ->
     lists:reverse(Acc);
+
 headers_strip_creds([{Key, Value0} | Rest], Acc) ->
     Value = case string:to_lower(Key) of
     "authorization" ->
@@ -732,6 +748,7 @@ httpdb_strip_creds(#httpdb{url = Url, headers = Headers} = HttpDb) ->
         url = couch_util:url_strip_password(Url),
         headers = headers_strip_creds(Headers, [])
     };
+
 httpdb_strip_creds(LocalDb) ->
     LocalDb.
 
@@ -747,79 +764,27 @@ adjust_maxconn(Src = #{<<"http_connections">> : = 1}, RepId) ->
     Msg = "Adjusting minimum number of HTTP source connections to 2 for ~p",
     couch_log:notice(Msg, [RepId]),
     Src#{<<"http_connections">> := 2};
+
 adjust_maxconn(Src, _RepId) ->
     Src.
 
 
--spec doc_update_completed(#rep_state{}) -> ok.
-doc_update_completed(#rep_state{db_name = null}) ->
-    ok;
-doc_update_completed(#rep_state{} = State) ->
-    #rep_state{
-        id = Id,
-        doc_id = DocId,
-        db_name = DbName,
-        start_time = Start,
-        stats = Stats0
-    } = State,
-    Stats = Stats0 ++ [{start_time, couch_replicator_utils:iso8601(Start)}],
-    couch_replicator_docs:update_doc_completed(DbName, DocId, Stats),
-    couch_log:notice("Replication `~s` completed (triggered by `~s:~s`)",
-        [Id, DbName, DocId]),
-    ok.
-
+do_last_checkpoint(#rep_state{seqs_in_progress = [],
+        highest_seq_done = {_Ts, ?LOWEST_SEQ}} = State) ->
+    {stop, normal, State};
 
 do_last_checkpoint(#rep_state{seqs_in_progress = [],
-    highest_seq_done = {_Ts, ?LOWEST_SEQ}} = State) ->
-    History = State#rep_state.checkoint_history,
-    Result = case finish_couch_job(State, ?ST_COMPLETED, History) of
-        ok -> normal;
-        {error, _} = Error -> Error
-    end,
-    {stop, Result, cancel_timer(State)};
-do_last_checkpoint(#rep_state{seqs_in_progress = [],
-    highest_seq_done = Seq} = State) ->
-    case do_checkpoint(State#rep_state{current_through_seq = Seq}) of
-    {ok, NewState} ->
-        couch_stats:increment_counter([couch_replicator, checkpoints, success]),
-        History = NewState#rep_state.checkpoint_history,
-        Result = case finish_couch_job(NewState, ?ST_COMPLETED, History) of
-            ok -> normal;
-            {error, _} = Error -> Error
-        end,
-        {stop, Result, cancel_timer(NewState)};
-    Error ->
-        couch_stats:increment_counter([couch_replicator, checkpoints, failure]),
-        {stop, Error, State}
-    end.
-
-
-finish_couch_job(#rep_state{} = State, FinishedState, Result) ->
-    #rep_state{job = Job, job_data = Jobdata} = State,
-    finish_couch_job(Job, JobData, FinishedState, Result).
-
-
-finish_couch_job(#{} = Job, #{} = JobData, FinishState, Result0) ->
-    #{?REP_ID := RepId} = JobData,
-    Result = case Result0 of
-        null -> null;
-        #{} -> Result0;
-        <<_/binary>> -> Result0;
-        Atom when is_atom(Atom) -> atom_to_binary(Atom, utf8)
-        Other -> couch_replicator_utils:rep_error_to_binary(Result0)
-    end,
-    JobData= JobData0#{
-        ?FINISHED_STATE => FinishState,
-        ?FINISHED_RESULT => Result
-    },
-    case couch_jobs:finish(undefined, Job, JobData) of
-        ok ->
-            doc_update_completed(State),
-            ok;
-        {error, Error} ->
-            Msg = "Replication ~s job could not finish. Error:~p",
-            couch_log:error(Msg, [RepId, Error]),
-            {error, Error}
+        highest_seq_done = Seq} = State) ->
+    State1 = State#rep_state{current_through_seq = Seq},
+    case do_checkpoint(State1) of
+        {ok, State2} ->
+            couch_stats:increment_counter([couch_replicator, checkpoints,
+                success]),
+            {stop, normal, State2};
+        Error ->
+            couch_stats:increment_counter([couch_replicator, checkpoints,
+                failure]),
+            {stop, Error, State}
     end.
 
 
@@ -868,8 +833,8 @@ init_state(#{} = Job, #{} = JobData) ->
     % Adjust minimum number of http source connections to 2 to avoid deadlock
     Src = adjust_maxconn(Src0, BaseId),
     {ok, Source} = couch_replicator_api_wrap:db_open(Src),
-    CreateTgt = get_value(create_target, Options, false),
-    TParams = maps:to_list(get_value(create_target_params, Options, #{}),
+    CreateTgt = couch_util:get_value(create_target, Options, false),
+    TParams = maps:to_list(couch_util:get_value(create_target_params, Options, #{}),
     {ok, Target} = couch_replicator_api_wrap:db_open(Tgt, CreateTgt, TParams),
 
     {ok, SourceInfo} = couch_replicator_api_wrap:get_db_info(Source),
@@ -887,10 +852,10 @@ init_state(#{} = Job, #{} = JobData) ->
     end,
     Stats2 = couch_replicator_stats:max_stats(Stats1, HistoryStats),
 
-    StartSeq1 = get_value(since_seq, Options, StartSeq0),
+    StartSeq1 = couch_util:get_value(since_seq, Options, StartSeq0),
     StartSeq = {0, StartSeq1},
 
-    SourceSeq = get_value(<<"update_seq">>, SourceInfo, ?LOWEST_SEQ),
+    SourceSeq = couch_util:get_value(<<"update_seq">>, SourceInfo, ?LOWEST_SEQ),
 
     #doc{body={CheckpointHistory}} = SourceLog,
     State = #rep_state{
@@ -910,12 +875,12 @@ init_state(#{} = Job, #{} = JobData) ->
         source_log = SourceLog,
         target_log = TargetLog,
         rep_starttime = StartTime,
-        src_starttime = get_value(<<"instance_start_time">>, SourceInfo),
-        tgt_starttime = get_value(<<"instance_start_time">>, TargetInfo),
+        src_starttime = couch_util:get_value(<<"instance_start_time">>, SourceInfo),
+        tgt_starttime = couch_util:get_value(<<"instance_start_time">>, TargetInfo),
         session_id = couch_uuids:random(),
         source_seq = SourceSeq,
-        use_checkpoints = get_value(use_checkpoints, Options),
-        checkpoint_interval = get_value(checkpoint_interval, Options),
+        use_checkpoints = couch_util:get_value(use_checkpoints, Options),
+        checkpoint_interval = couch_util:get_value(checkpoint_interval, Options),
         stats = Stats2,
         doc_id = DocId,
         db_name = DbName,
@@ -996,7 +961,9 @@ changes_manager_loop_open(Parent, ChangesQueue, BatchSize, Ts) ->
 
 
 do_checkpoint(#rep_state{use_checkpoints=false} = State) ->
-    NewState = State#rep_state{checkpoint_history = {[{<<"use_checkpoints">>, false}]} },
+    NewState = State#rep_state{
+        checkpoint_history = {[{<<"use_checkpoints">>, false}]}
+    },
     {ok, update_job_state(NewState)};
 do_checkpoint(#rep_state{current_through_seq=Seq, committed_seq=Seq} = State) ->
     {ok, update_job_state(State)};
@@ -1021,10 +988,10 @@ do_checkpoint(State) ->
     case commit_to_both(Source, Target) of
     {source_error, Reason} ->
          {checkpoint_commit_failure,
-             <<"Failure on source commit: ", (to_binary(Reason))/binary>>};
+             <<"Failure on source commit: ", (couch_util:to_binary(Reason))/binary>>};
     {target_error, Reason} ->
          {checkpoint_commit_failure,
-             <<"Failure on target commit: ", (to_binary(Reason))/binary>>};
+             <<"Failure on target commit: ", (couch_util:to_binary(Reason))/binary>>};
     {SrcInstanceStartTime, TgtInstanceStartTime} ->
         couch_log:notice("recording a checkpoint for `~s` -> `~s` at source update_seq ~p",
             [SourceName, TargetName, NewSeq]),
@@ -1048,7 +1015,7 @@ do_checkpoint(State) ->
             {<<"session_id">>, SessionId},
             {<<"source_last_seq">>, NewSeq},
             {<<"replication_id_version">>, ?REP_ID_VERSION}
-        ] ++ case get_value(doc_ids, Options) of
+        ] ++ case couch_util:get_value(doc_ids, Options) of
         undefined ->
             [];
         _DocIds ->
@@ -1101,18 +1068,16 @@ update_checkpoint(Db, Doc, DbType) ->
         update_checkpoint(Db, Doc)
     catch throw:{checkpoint_commit_failure, Reason} ->
         throw({checkpoint_commit_failure,
-            <<"Error updating the ", (to_binary(DbType))/binary,
-                " checkpoint document: ", (to_binary(Reason))/binary>>})
+            <<"Error updating the ", (couch_util:to_binary(DbType))/binary,
+                " checkpoint document: ", (couch_util:to_binary(Reason))/binary>>})
     end.
 
 
 update_checkpoint(Db, #doc{id = LogId, body = LogBody} = Doc) ->
     try
         case couch_replicator_api_wrap:update_doc(Db, Doc, [delay_commit]) of
-        {ok, PosRevId} ->
-            PosRevId;
-        {error, Reason} ->
-            throw({checkpoint_commit_failure, Reason})
+            {ok, PosRevId} -> PosRevId;
+            {error, Reason} -> throw({checkpoint_commit_failure, Reason})
         end
     catch throw:conflict ->
         case (catch couch_replicator_api_wrap:open_doc(Db, LogId, [ejson_body])) of
@@ -1167,17 +1132,17 @@ commit_to_both(Source, Target) ->
 compare_replication_logs(SrcDoc, TgtDoc) ->
     #doc{body={RepRecProps}} = SrcDoc,
     #doc{body={RepRecPropsTgt}} = TgtDoc,
-    case get_value(<<"session_id">>, RepRecProps) ==
-            get_value(<<"session_id">>, RepRecPropsTgt) of
+    case couch_util:get_value(<<"session_id">>, RepRecProps) ==
+            couch_util:get_value(<<"session_id">>, RepRecPropsTgt) of
     true ->
         % if the records have the same session id,
         % then we have a valid replication history
-        OldSeqNum = get_value(<<"source_last_seq">>, RepRecProps, ?LOWEST_SEQ),
-        OldHistory = get_value(<<"history">>, RepRecProps, []),
+        OldSeqNum = couch_util:get_value(<<"source_last_seq">>, RepRecProps, ?LOWEST_SEQ),
+        OldHistory = couch_util:get_value(<<"history">>, RepRecProps, []),
         {OldSeqNum, OldHistory};
     false ->
-        SourceHistory = get_value(<<"history">>, RepRecProps, []),
-        TargetHistory = get_value(<<"history">>, RepRecPropsTgt, []),
+        SourceHistory = couch_util:get_value(<<"history">>, RepRecProps, []),
+        TargetHistory = couch_util:get_value(<<"history">>, RepRecPropsTgt, []),
         couch_log:notice("Replication records differ. "
                 "Scanning histories to find a common ancestor.", []),
         couch_log:debug("Record on source:~p~nRecord on target:~p~n",
@@ -1189,19 +1154,20 @@ compare_replication_logs(SrcDoc, TgtDoc) ->
 compare_rep_history(S, T) when S =:= [] orelse T =:= [] ->
     couch_log:notice("no common ancestry -- performing full replication", []),
     {?LOWEST_SEQ, []};
+
 compare_rep_history([{S} | SourceRest], [{T} | TargetRest] = Target) ->
-    SourceId = get_value(<<"session_id">>, S),
+    SourceId = couch_util:get_value(<<"session_id">>, S),
     case has_session_id(SourceId, Target) of
     true ->
-        RecordSeqNum = get_value(<<"recorded_seq">>, S, ?LOWEST_SEQ),
+        RecordSeqNum = couch_util:get_value(<<"recorded_seq">>, S, ?LOWEST_SEQ),
         couch_log:notice("found a common replication record with source_seq ~p",
             [RecordSeqNum]),
         {RecordSeqNum, SourceRest};
     false ->
-        TargetId = get_value(<<"session_id">>, T),
+        TargetId = couch_util:get_value(<<"session_id">>, T),
         case has_session_id(TargetId, SourceRest) of
         true ->
-            RecordSeqNum = get_value(<<"recorded_seq">>, T, ?LOWEST_SEQ),
+            RecordSeqNum = couch_util:get_value(<<"recorded_seq">>, T, ?LOWEST_SEQ),
             couch_log:notice("found a common replication record with source_seq ~p",
                 [RecordSeqNum]),
             {RecordSeqNum, TargetRest};
@@ -1213,17 +1179,16 @@ compare_rep_history([{S} | SourceRest], [{T} | TargetRest] = Target) ->
 
 has_session_id(_SessionId, []) ->
     false;
+
 has_session_id(SessionId, [{Props} | Rest]) ->
-    case get_value(<<"session_id">>, Props, nil) of
-    SessionId ->
-        true;
-    _Else ->
-        has_session_id(SessionId, Rest)
+    case couch_util:get_value(<<"session_id">>, Props, nil) of
+        SessionId -> true;
+        _Else -> has_session_id(SessionId, Rest)
     end.
 
 
 get_pending_count(#rep_state{options = Options} = St) ->
-    Timeout = get_value(connection_timeout, Options),
+    Timeout = couch_util:get_value(connection_timeout, Options),
     TimeoutMicro = Timeout * 1000,
     case get(pending_count_state) of
         {LastUpdate, PendingCount} ->
@@ -1251,6 +1216,7 @@ get_pending_count_int(#rep_state{source = #httpdb{} = Db0}=St) ->
     _ ->
         null
     end;
+
 get_pending_count_int(#rep_state{source = Db}=St) ->
     {_, Seq} = St#rep_state.highest_seq_done,
     {ok, Pending} = couch_replicator_api_wrap:get_pending_count(Db, Seq),
@@ -1273,8 +1239,9 @@ update_job_stats(JTx, #rep_state{} = State, NewStats) ->
     #rep_state{job = Job, job_data = JobData} = State,
     JsonStats = couch_replicator_stats:to_json(NewStats),
     JobData1 = JobData#{?REP_STATS => JsonStats},
-    {Job1, JobData2} = update_job_data(JTx, Job, JobData1),
-    State#rep_state{job := Job1, job_data := JobData2}.
+    JobData2 = maybe_heal(JobData1, erlang:system_time(second)),
+    {Job1, JobData3} = update_job_data(JTx, Job, JobData2),
+    State#rep_state{job := Job1, job_data := JobData3}.
 
 
 rep_stats(State) ->
@@ -1295,17 +1262,21 @@ rep_stats(State) ->
 
 replication_start_error({unauthorized, DbUri}) ->
     {unauthorized, <<"unauthorized to access or create database ", DbUri/binary>>};
+
 replication_start_error({db_not_found, DbUri}) ->
     {db_not_found, <<"could not open ", DbUri/binary>>};
+
 replication_start_error({http_request_failed, _Method, Url0,
         {error, {error, {conn_failed, {error, nxdomain}}}}}) ->
     Url = ?l2b(couch_util:url_strip_password(Url0)),
     {nxdomain, <<"could not resolve ", Url/binary>>};
+
 replication_start_error({http_request_failed, Method0, Url0,
         {error, {code, Code}}}) when is_integer(Code) ->
     Url = ?l2b(couch_util:url_strip_password(Url0)),
     Method = ?l2b(Method0),
     {http_error_code, Code, <<Method/binary, " ", Url/binary>>};
+
 replication_start_error(Error) ->
     Error.
 
@@ -1320,8 +1291,8 @@ log_replication_start(#rep_state{} = RepState) ->
         target_name = Target,
         session_id = Sid,
     } = RepState,
-    Workers = get_value(worker_processes, Options),
-    BatchSize = get_value(worker_batch_size, Options),
+    Workers = couch_util:get_value(worker_processes, Options),
+    BatchSize = couch_util:get_value(worker_batch_size, Options),
     From = case DbName of
         Name when is_binary(Name) ->
             io_lib:format("from doc ~s:~s", [Name, DocId]);
@@ -1347,7 +1318,7 @@ check_user_filter(#rep_state{} = State) ->
             LogMsg = "~p : Replication id was updated ~p -> ~p",
             couch_log:error(LogMsg, [?MODULE, RepId, OtherId]),
             reschedule_job(JTx, Job, JobData),
-            throw(finished)
+            exit({shutdown, finished})
     end.
 
 
@@ -1381,6 +1352,13 @@ optimize_rate_limited_job(#{} = Options, _Other) ->
     Options.
 
 
+close_endpoints(State) ->
+    State1 = cancel_timer(State),
+    couch_replicator_api_wrap:db_close(State1#rep_state.source),
+    couch_replicator_api_wrap:db_close(State1#rep_state.target),
+    ok.
+
+
 % Health threshold is the minimum amount of time an unhealthy job should run
 % crashing before it is considered to be healthy again. HealtThreashold should
 % not be 0 as jobs could start and immediately crash, and it shouldn't be
@@ -1404,10 +1382,6 @@ accept_jitter() ->
     Jitter = config:get_integer("replicator", "accept_jitter",
         ?ACCEPT_JITTER_DEFAULT),
     couch_rand:uniform(erlang:max(1, Jitter)).
-
-
-update_docs() ->
-    config:get_boolean("replicator", "update_docs", ?DEFAULT_UPDATE_DOCS).
 
 
 
@@ -1435,13 +1409,14 @@ scheduler_job_format_status_test() ->
     Target = <<"http://u:p@h2/d2">>,
     Rep = #rep{
         id = {"base", "+ext"},
-        source = couch_replicator_docs:parse_rep_db(Source, #{}, #{}),
-        target = couch_replicator_docs:parse_rep_db(Target, #{}, #{}),
+        source = couch_replicator_docs:parse_rep_db(Source, [], []),
+        target = couch_replicator_docs:parse_rep_db(Target, [], []),
         options = [{create_target, true}],
         doc_id = <<"mydoc">>,
         db_name = <<"mydb">>
     },
     State = #rep_state{
+        rep_details = Rep,
         source = Rep#rep.source,
         target = Rep#rep.target,
         session_id = <<"a">>,
