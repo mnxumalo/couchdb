@@ -19,13 +19,9 @@
     parse_rep_doc/2,
     before_doc_update/3,
     after_doc_read/2,
-    ensure_rep_db_exists/0,
-    ensure_rep_ddoc_exists/1,
-    remove_state_fields/2,
-    update_doc_completed/3,
-    update_failed/3,
-    update_triggered/3,
-    update_error/4
+    remove_state_fields/3,
+    update_doc_completed/4,
+    update_failed/4
 ]).
 
 
@@ -70,8 +66,11 @@
 ]).
 
 
-remove_state_fields(DbName, DocId) ->
-    update_rep_doc(DbName, DocId, [
+remove_state_fields(null, null, null) ->
+    ok;
+
+remove_state_fields(DbName, DbUUID, DocId) ->
+    update_rep_doc(DbName, DbUUID, DocId, [
         {?REPLICATION_STATE, undefined},
         {?REPLICATION_STATE_TIME, undefined},
         {?REPLICATION_STATE_REASON, undefined},
@@ -79,61 +78,35 @@ remove_state_fields(DbName, DocId) ->
         {?REPLICATION_STATS, undefined}]).
 
 
--spec update_doc_completed(binary(), binary(), [_]) -> any().
-update_doc_completed(DbName, DocId, Stats) ->
-    update_rep_doc(DbName, DocId, [
+-spec update_doc_completed(binary(), binary(), [_]) -> ok.
+update_doc_completed(null, null, _) ->
+    ok;
+
+update_doc_completed(DbName, DbUUID, DocId, Stats) ->
+    update_rep_doc(DbName, DbUUID, DocId, [
         {?REPLICATION_STATE, ?ST_COMPLETED},
         {?REPLICATION_STATE_REASON, undefined},
         {?REPLICATION_STATS, {Stats}}]),
     couch_stats:increment_counter([couch_replicator, docs,
-        completed_state_updates]).
+        completed_state_updates]),
+    ok.
 
 
--spec update_failed(binary(), binary(), any()) -> any().
-update_failed(DbName, DocId, Error) ->
+-spec update_failed(binary(), binary(), binary(), any()) -> ok.
+update_failed(null, null, null, _) ->
+    ok;
+
+update_failed(DbName, DbUUID, DocId, Error) ->
     Reason = error_reason(Error),
     couch_log:error("Error processing replication doc `~s` from `~s`: ~s",
         [DocId, DbName, Reason]),
-    update_rep_doc(DbName, DocId, [
+    update_rep_doc(DbName, DbUUID, DocId, [
         {?REPLICATION_STATE, ?ST_FAILED},
         {?REPLICATION_STATS, undefined},
         {?REPLICATION_STATE_REASON, Reason}]),
     couch_stats:increment_counter([couch_replicator, docs,
-        failed_state_updates]).
-
-
--spec update_triggered(binary(), binary(), binary()) -> ok.
-update_triggered(Id, DocId, DbName) ->
-    update_rep_doc(DbName, DocId, [
-        {?REPLICATION_STATE, ?ST_TRIGGERED},
-        {?REPLICATION_STATE_REASON, undefined},
-        {?REPLICATION_ID, Id},
-        {?REPLICATION_STATS, undefined}]),
+        failed_state_updates]),
     ok.
-
-
--spec update_error(binary(), binary(), binary(), any()) -> ok.
-update_error(RepId0, DbName, DocId, Error) ->
-    Reason = error_reason(Error),
-    RepId = case RepId0 of
-        Id when is_binary(Id) -> Id;
-        _Other -> null
-    end,
-    update_rep_doc(DbName, DocId, [
-        {?REPLICATION_STATE, ?ST_ERROR},
-        {?REPLICATION_STATE_REASON, Reason},
-        {?REPLICATION_STATS, undefined},
-        {?REPLICATION_ID, BinRepId}]),
-    ok.
-
-
--spec ensure_rep_db_exists() -> ok.
-ensure_rep_db_exists() ->
-    Opts = [?CTX, sys_db],
-    case fabric2_db:create(?REP_DB_NAME, [?CTX, sys_db]) of
-        {error, file_exists} -> ok;
-        {ok, _Db} -> ok
-    end.
 
 
 -spec parse_rep_doc({[_]}) -> #{}.
@@ -228,15 +201,16 @@ parse_proxy_settings(#{} = Doc) ->
     end.
 
 
-update_rep_doc(RepDbName, RepDocId, KVs) ->
-    update_rep_doc(RepDbName, RepDocId, KVs, 1).
+update_rep_doc(RepDbName, RepDbUUID, RepDocId, KVs) ->
+    update_rep_doc(RepDbName, RepDbUUID, RepDocId, KVs, 1).
 
 
-update_rep_doc(RepDbName, RepDocId, KVs, Wait) when is_binary(RepDocId) ->
+update_rep_doc(RepDbName, RepDbUUID, RepDocId, KVs, Wait)
+        when is_binary(RepDocId) ->
     try
-        case open_rep_doc(RepDbName, RepDocId) of
+        case open_rep_doc(RepDbName, RepDbUUID, RepDocId) of
             {ok, LastRepDoc} ->
-                update_rep_doc(RepDbName, LastRepDoc, KVs, Wait * 2);
+                update_rep_doc(RepDbName, RepDbUUID, LastRepDoc, KVs, Wait * 2);
             _ ->
                 ok
         end
@@ -245,10 +219,10 @@ update_rep_doc(RepDbName, RepDocId, KVs, Wait) when is_binary(RepDocId) ->
             Msg = "Conflict when updating replication doc `~s`. Retrying.",
             couch_log:error(Msg, [RepDocId]),
             ok = timer:sleep(couch_rand:uniform(erlang:min(128, Wait)) * 100),
-            update_rep_doc(RepDbName, RepDocId, KVs, Wait * 2)
+            update_rep_doc(RepDbName, RepDbUUID, RepDocId, KVs, Wait * 2)
     end;
 
-update_rep_doc(RepDbName, #doc{body = {RepDocBody}} = RepDoc, KVs, _Try) ->
+update_rep_doc(RepDbName, RepDbUUID, #doc{body = {RepDocBody}} = RepDoc, KVs, _Try) ->
     NewRepDocBody = lists:foldl(
         fun({K, undefined}, Body) ->
                 lists:keydelete(K, 1, Body);
@@ -273,13 +247,14 @@ update_rep_doc(RepDbName, #doc{body = {RepDocBody}} = RepDoc, KVs, _Try) ->
     _ ->
         % Might not succeed - when the replication doc is deleted right
         % before this update (not an error, ignore).
-        save_rep_doc(RepDbName, RepDoc#doc{body = {NewRepDocBody}})
+        save_rep_doc(RepDbName, RepDBUUID, RepDoc#doc{body = {NewRepDocBody}})
     end.
 
 
-open_rep_doc(DbName, DocId) ->
+open_rep_doc(DbName, DbUUID, DocId) when is_binary(DbName), is_binary(DbUUID),
+            is_binary(DocId) ->
     try
-        case fabric2_db:open(DbName, [?CTX, sys_db]) of
+        case fabric2_db:open(DbName, [?CTX, sys_db, {uuid, DbUUID}]) of
             {ok, Db} -> fabric2_db:open_doc(Db, DocId, [ejson_body]);
             Else -> Else
         end
@@ -289,8 +264,8 @@ open_rep_doc(DbName, DocId) ->
     end.
 
 
-save_rep_doc(DbName, Doc) ->
-    {ok, Db} = fabric2_db:open(DbName, [?CTX, sys_db]),
+save_rep_doc(DbName, DbUUID, Doc) when is_binary(DbName), is_binary(DbUUID) ->
+    {ok, Db} = fabric2_db:open(DbName, [?CTX, sys_db, {uuid, DbUUID}]),
     try
         fabric2_db:update_doc(Db, Doc, [])
     catch
@@ -602,7 +577,7 @@ before_doc_update(#doc{body = {Body}} = Doc, Db, _UpdateType) ->
             BodyStr = couch_util:json_encode(Doc1#doc.body),
             BodyMap = couch_util:json_decode(BodyStr, [return_maps]),
             couch_replicator_validate_doc:validate(BodyMap),
-            % Try to fully parsing the doc into an internal replication record
+            % Try to fully parse the doc into an internal replication record
             try
                 parse_rep_doc(Doc1#doc.body)
             catch
